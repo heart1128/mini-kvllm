@@ -776,6 +776,352 @@ def paged_attention_decode_fp8(
     return output
 
 
+# ===================== KIVI KV Cache 量化相关 =====================
+# KIVI 设计要点 (paged 适配版):
+#   - K: 块内 per-channel-per-group 非对称量化
+#        scale = (max - min) / (2^bits - 1)
+#        zero  = min
+#        q     = clamp(round((x - zero) / scale), 0, 2^bits - 1)
+#        反量化: x = q * scale + zero
+#   - V: per-token-per-head 对称量化 (与 fp8_per_token_head 同思路)
+#        scale = amax / qmax,  q = clamp(round(x/scale), -qmax, qmax)
+#        反量化: x = q * scale
+#   - 实现简化: 量化值不做 bit-pack, 直接放入 int8 容器 (每元素占 1 byte)。
+#     这样 paged 访存与 fp16 / fp8 路径完全同构, kernel 索引计算 0 修改成本。
+#     如需进一步省显存, 可在 store/decode kernel 里加 nibble pack。
+
+# K: 非对称量化的 qmax (无符号)
+@triton.jit
+def _kivi_qmax_unsigned(bits):
+    return (1 << bits) - 1
+
+
+@triton.jit
+def store_kvcache_kivi_kernel(
+    key_ptr,            # 待写入的 key (num_tokens, num_kv_heads, head_dim)
+    value_ptr,          # 待写入的 value
+    k_cache_ptr,        # int8 K cache  (num_blocks, block_size, num_kv_heads, head_dim)
+    v_cache_ptr,        # int8 V cache  同上
+    k_scale_ptr,        # K scale  (num_blocks, num_kv_heads, n_groups), fp32
+    k_zero_ptr,         # K zero   同上, fp32
+    v_scale_ptr,        # V scale  (num_blocks, block_size, num_kv_heads), fp32
+    k_residual_ptr,     # K fp16 residual (num_seqs, residual_length, num_kv_heads, head_dim)
+    v_residual_ptr,     # V fp16 residual  同上
+    slot_mapping_ptr,   # token -> cache slot
+    residual_slots_ptr, # token -> residual buffer 的行号 (seq_slot)
+    residual_lens_ptr,  # (num_seqs,) 暂未使用; 留作扩展
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    group_size: tl.constexpr,
+    residual_length: tl.constexpr,
+    n_groups: tl.constexpr,
+    BITS: tl.constexpr,
+):
+    """
+    KIVI 写入路径:
+      1) 把当前 (token, head) 的 fp16 K/V 同步写入 residual buffer (供 decode 阶段的尾部直接用)
+      2) 同步写入 paged cache (量化):
+         - K: 在当前 token 的 head_dim 内, 每 group_size 个元素求 (min, max) -> scale/zero -> 量化
+              scale/zero 存入 (block_idx, kv_head_idx, group_idx)
+         - V: 求 amax -> scale -> 对称量化, scale 存入 (block_idx, block_offset, kv_head_idx)
+
+    注意: K 的"块内 per-channel"严格说应在整个块 (block_size 个 token) 收集完后再求 channel min/max。
+          这里采用每 token 独立标定 (per-token-per-channel-group), 等价于把分组从 (head_dim/group) 扩展为
+          (block_size, head_dim/group)。这是与 paging 兼容的最简实现, 避免跨 token 同步; 精度比原论文
+          的"整段序列 per-channel"略差, 但与 paging 块独立性完全自洽。
+    """
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx == -1:
+        return
+
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+
+    head_offsets = tl.arange(0, head_dim)
+    input_offset = (token_idx * num_kv_heads * head_dim +
+                    head_idx * head_dim +
+                    head_offsets)
+    cache_offset = (block_idx * block_size * num_kv_heads * head_dim +
+                    block_offset * num_kv_heads * head_dim +
+                    head_idx * head_dim +
+                    head_offsets)
+
+    key = tl.load(key_ptr + input_offset).to(tl.float32)
+    value = tl.load(value_ptr + input_offset).to(tl.float32)
+
+    # ---- 1) 写 residual fp16 buffer ----
+    # residual 是 ring buffer: 行号 = slot, 列号 = (slot_idx % residual_length)
+    seq_slot = tl.load(residual_slots_ptr + token_idx)
+    res_pos = slot_idx % residual_length  # 简化: 直接按 slot 取模, decode 端用同样的 mapping
+    res_offset = (seq_slot * residual_length * num_kv_heads * head_dim +
+                  res_pos * num_kv_heads * head_dim +
+                  head_idx * head_dim +
+                  head_offsets)
+    tl.store(k_residual_ptr + res_offset, key.to(k_residual_ptr.dtype.element_ty))
+    tl.store(v_residual_ptr + res_offset, value.to(v_residual_ptr.dtype.element_ty))
+
+    # ---- 2a) K 量化: 对每个 group 求 (min, max), 量化为 [0, 2^bits-1] ----
+    # qmax_k 是 constexpr 计算结果 (Python int), 不要再用 float() 包 tl 标量
+    qmax_k: tl.constexpr = (1 << BITS) - 1  # 例如 2-bit -> 3, 4-bit -> 15
+    qmax_k_f: tl.constexpr = float(qmax_k)
+    group_ids = head_offsets // group_size  # 每个 head_dim 元素属于哪个 group
+    # 对每个 group 单独算 min/max: 用 mask + reduction
+    for g in tl.static_range(0, n_groups):
+        mask_g = group_ids == g
+        # 计算 min/max: 用 where 给非本 group 设极值
+        xmax = tl.max(tl.where(mask_g, key,  -1.0e30))
+        xmin = tl.min(tl.where(mask_g, key,   1.0e30))
+        rng = xmax - xmin
+        scale = tl.where(rng > 0, rng / qmax_k_f, 1.0)
+        zero = xmin
+        # 量化: q = round((x - zero) / scale), 仅本 group 元素生效
+        q = (key - zero) / scale
+        # round to nearest, clamp 到 [0, qmax_k]
+        q = tl.minimum(tl.maximum(q + 0.5 * tl.where(q >= 0, 1.0, -1.0), 0.0), qmax_k_f)
+        q_int = q.to(tl.int32)
+        # 写量化 K (int8 容器), 仅写本 group 的位置
+        tl.store(k_cache_ptr + cache_offset, q_int.to(k_cache_ptr.dtype.element_ty), mask=mask_g)
+        # 写 scale/zero
+        # shape: (num_blocks, block_size, num_kv_heads, n_groups)
+        # 注意必须包含 block_offset 维: 同一物理块内多个 token 都要写自己的 scale/zero,
+        # 否则后写覆盖先写, decode 反量化全错
+        sz_off = (block_idx * block_size * num_kv_heads * n_groups +
+                  block_offset * num_kv_heads * n_groups +
+                  head_idx * n_groups + g)
+        tl.store(k_scale_ptr + sz_off, scale)
+        tl.store(k_zero_ptr + sz_off, zero)
+
+    # ---- 2b) V 量化: per-token-per-head 对称, qmax = 2^(bits-1) - 1 (有符号空间) ----
+    qmax_v: tl.constexpr = (1 << (BITS - 1)) - 1 if BITS > 1 else 1
+    qmax_v_f: tl.constexpr = float(qmax_v)
+    neg_qmax_v_f: tl.constexpr = float(-qmax_v)
+    v_amax = tl.max(tl.abs(value))
+    v_scale = tl.where(v_amax > 0, v_amax / qmax_v_f, 1.0)
+    vq = value / v_scale
+    # round + clamp 到 [-qmax_v, qmax_v]
+    vq = tl.minimum(tl.maximum(vq + 0.5 * tl.where(vq >= 0, 1.0, -1.0),
+                               neg_qmax_v_f), qmax_v_f)
+    vq_int = vq.to(tl.int32)
+    tl.store(v_cache_ptr + cache_offset, vq_int.to(v_cache_ptr.dtype.element_ty))
+    vs_off = (block_idx * block_size * num_kv_heads +
+              block_offset * num_kv_heads + head_idx)
+    tl.store(v_scale_ptr + vs_off, v_scale)
+
+
+def store_kvcache_kivi(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    k_zero: torch.Tensor,
+    v_scale: torch.Tensor,
+    k_residual: torch.Tensor,
+    v_residual: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    residual_slots: torch.Tensor,
+    residual_lens: torch.Tensor,
+    block_size: int,
+    group_size: int,
+    residual_length: int,
+    bits: int,
+):
+    """
+    KIVI 写入封装: 同时写 residual fp16 buffer 与 paged 量化 cache。
+    """
+    num_tokens, num_kv_heads, head_dim = key.shape
+    key = key.contiguous()
+    value = value.contiguous()
+    assert head_dim % group_size == 0
+    n_groups = head_dim // group_size
+
+    grid = (num_tokens, num_kv_heads)
+    store_kvcache_kivi_kernel[grid](
+        key, value, k_cache, v_cache,
+        k_scale, k_zero, v_scale,
+        k_residual, v_residual,
+        slot_mapping, residual_slots, residual_lens,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        group_size=group_size,
+        residual_length=residual_length,
+        n_groups=n_groups,
+        BITS=bits,
+    )
+
+
+@triton.jit
+def paged_attention_decode_kivi_kernel(
+    output_ptr,
+    query_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_scale_ptr,        # (num_blocks, num_kv_heads, n_groups)
+    k_zero_ptr,         # 同上
+    v_scale_ptr,        # (num_blocks, block_size, num_kv_heads)
+    block_tables_ptr,
+    context_lens_ptr,
+    scale: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_num_blocks: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    group_size: tl.constexpr,
+    n_groups: tl.constexpr,
+):
+    """
+    decode 阶段, 从 KIVI 量化 paged cache 读取并反量化后做注意力。
+    与 paged_attention_decode_kernel 同构, 仅 K/V 载入后多一步反量化。
+    本实现"读全部 paged + residual 同时写入" — residual buffer 仅用于
+    需要更高精度的尾段计算 (可选), 这里为最小可跑, decode 路径只走 paged 反量化。
+    """
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+
+    context_len = tl.load(context_lens_ptr + batch_idx)
+
+    offs_d = tl.arange(0, head_dim)
+    q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    q = tl.load(query_ptr + q_offset)
+
+    group_ids = offs_d // group_size  # 每个 head_dim 元素属于的 group
+
+    acc = tl.zeros([head_dim], dtype=tl.float32)
+    l_i = 0.0
+    m_i = -1e10
+
+    max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
+
+    for chunk_idx in range(max_chunks):
+        token_start = chunk_idx * BLOCK_N
+        if token_start < context_len:
+            offs_n = token_start + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < context_len
+
+            qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 1e10
+            for i in range(BLOCK_N):
+                token_idx = token_start + i
+                if token_idx < context_len:
+                    block_num = token_idx // block_size
+                    block_offset = token_idx % block_size
+                    if block_num < max_num_blocks:
+                        block_table_offset = batch_idx * max_num_blocks + block_num
+                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+                        if physical_block_idx != -1:
+                            # 载入 int8 K 并反量化
+                            k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
+                                       block_offset * num_kv_heads * head_dim +
+                                       kv_head_idx * head_dim + offs_d)
+                            k_q = tl.load(k_cache_ptr + k_offset).to(tl.float32)
+                            # 加载该 (block, slot, head, group) 的 scale/zero, 按 offs_d 广播
+                            # k_scale shape: (num_blocks, block_size, num_kv_heads, n_groups)
+                            sz_base = (physical_block_idx * block_size * num_kv_heads * n_groups +
+                                       block_offset * num_kv_heads * n_groups +
+                                       kv_head_idx * n_groups)
+                            # 用循环展开各 group
+                            k_vec = tl.zeros([head_dim], dtype=tl.float32)
+                            for g in tl.static_range(0, n_groups):
+                                mask_g = group_ids == g
+                                s = tl.load(k_scale_ptr + sz_base + g)
+                                z = tl.load(k_zero_ptr + sz_base + g)
+                                k_vec = tl.where(mask_g, k_q * s + z, k_vec)
+
+                            score = tl.sum(q * k_vec) * scale
+                            mask_i = tl.arange(0, BLOCK_N) == i
+                            qk = tl.where(mask_i, score, qk)
+
+            qk = tl.where(mask_n, qk, -1e10)
+
+            m_ij = tl.max(qk)
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new)
+            acc = acc * alpha
+            l_i = l_i * alpha
+
+            for i in range(BLOCK_N):
+                token_idx = token_start + i
+                if token_idx < context_len:
+                    block_num = token_idx // block_size
+                    block_offset = token_idx % block_size
+                    if block_num < max_num_blocks:
+                        block_table_offset = batch_idx * max_num_blocks + block_num
+                        physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+                        if physical_block_idx != -1:
+                            v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
+                                       block_offset * num_kv_heads * head_dim +
+                                       kv_head_idx * head_dim + offs_d)
+                            v_q = tl.load(v_cache_ptr + v_offset).to(tl.float32)
+                            vs_off = (physical_block_idx * block_size * num_kv_heads +
+                                      block_offset * num_kv_heads + kv_head_idx)
+                            v_s = tl.load(v_scale_ptr + vs_off)
+                            v_vec = v_q * v_s
+
+                            mask_i = tl.arange(0, BLOCK_N) == i
+                            weight = tl.sum(tl.where(mask_i, p, 0.0))
+                            acc = acc + weight * v_vec
+                            l_i = l_i + weight
+
+            m_i = m_i_new
+
+    output = acc / l_i
+    output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    tl.store(output_ptr + output_offset, output.to(output_ptr.dtype.element_ty))
+
+
+def paged_attention_decode_kivi(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    k_zero: torch.Tensor,
+    v_scale: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    block_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    """
+    KIVI decode 反量化 paged attention 的 Python 封装。
+    输出 dtype 与 query 一致。
+    """
+    batch_size = query.shape[0]
+    max_num_blocks = block_tables.shape[1]
+    query = query.contiguous()
+    output = torch.empty_like(query)
+    BLOCK_N = 64 if head_dim <= 128 else 32
+    assert head_dim % group_size == 0
+    n_groups = head_dim // group_size
+    grid = (batch_size, num_heads)
+    paged_attention_decode_kivi_kernel[grid](
+        output, query, k_cache, v_cache,
+        k_scale, k_zero, v_scale,
+        block_tables, context_lens,
+        scale=scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        max_num_blocks=max_num_blocks,
+        BLOCK_N=BLOCK_N,
+        group_size=group_size,
+        n_groups=n_groups,
+    )
+    return output
+
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -793,15 +1139,23 @@ class Attention(nn.Module):
         self.block_size = block_size
         self.k_cache = self.v_cache = torch.tensor([])
         # KV cache 量化相关属性，默认不量化；由 ModelRunner.allocate_kv_cache 注入实际值
-        self.kv_cache_dtype = 'auto'   # "auto" | "fp8_per_tensor" | "fp8_per_token_head"
-        self.k_scale = None            # FP8 量化时的 K scale 张量
-        self.v_scale = None            # FP8 量化时的 V scale 张量
+        self.kv_cache_dtype = 'auto'   # "auto" | "fp8_per_tensor" | "fp8_per_token_head" | "kivi_2bit" | "kivi_4bit"
+        self.k_scale = None            # FP8/KIVI 量化时的 K scale 张量
+        self.v_scale = None            # FP8/KIVI 量化时的 V scale 张量
+        # KIVI 专用
+        self.k_zero = None             # K 的 zero-point (KIVI 非对称量化)
+        self.k_residual = None         # K 的 fp16 residual buffer
+        self.v_residual = None         # V 的 fp16 residual buffer
+        self.kivi_bits = 0
+        self.kivi_group_size = 0
+        self.kivi_residual_length = 0
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        # 是否启用 FP8 量化路径
-        fp8_enabled = self.kv_cache_dtype != 'auto'
+        # 路径选择: auto / fp8_* / kivi_*
+        kivi_enabled = isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith('kivi')
+        fp8_enabled = (self.kv_cache_dtype != 'auto') and not kivi_enabled
 
         # Store current k, v into cache if cache is allocated
         if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
@@ -816,7 +1170,16 @@ class Attention(nn.Module):
                 k_to_store = k.contiguous()
                 v_to_store = v.contiguous()
 
-            if fp8_enabled:
+            if kivi_enabled:
+                # KIVI 路径: 同步写 paged 量化 cache + fp16 residual buffer
+                store_kvcache_kivi(
+                    k_to_store, v_to_store, k_cache, v_cache,
+                    self.k_scale, self.k_zero, self.v_scale,
+                    self.k_residual, self.v_residual,
+                    context.slot_mapping, context.residual_slots, context.residual_lens,
+                    self.block_size, self.kivi_group_size, self.kivi_residual_length, self.kivi_bits,
+                )
+            elif fp8_enabled:
                 # FP8 量化写入：量化 + 写 scale
                 store_kvcache_fp8(
                     k_to_store, v_to_store, k_cache, v_cache,
@@ -840,7 +1203,16 @@ class Attention(nn.Module):
             # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:
-            if fp8_enabled:
+            if kivi_enabled:
+                # KIVI decode: 反量化 paged cache 后做 attention
+                o = paged_attention_decode_kivi(
+                    q, k_cache, v_cache,
+                    self.k_scale, self.k_zero, self.v_scale,
+                    context.block_tables, context.context_lens,
+                    scale, self.num_heads, self.num_kv_heads, self.head_dim,
+                    self.block_size, self.kivi_group_size,
+                )
+            elif fp8_enabled:
                 # decode 阶段从 FP8 cache 读取并反量化
                 o = paged_attention_decode_fp8(
                     q, k_cache, v_cache, self.k_scale, self.v_scale,

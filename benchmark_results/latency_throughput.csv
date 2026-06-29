@@ -1,4 +1,4 @@
 模式,TTFT(ms),TPOT(ms),Decode吞吐(tok/s)
-auto,71.9,39.74,25.2
-fp8_per_tensor,55.0,45.44,22.0
-fp8_per_token_head,57.0,39.21,25.5
+auto,51.7,40.94,24.4
+fp8_per_tensor,54.9,46.80,21.4
+fp8_per_token_head,50.8,42.07,23.8

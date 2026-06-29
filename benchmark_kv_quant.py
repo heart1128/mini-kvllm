@@ -1,5 +1,5 @@
 """
-KV Cache FP8 量化 Benchmark 
+KV Cache FP8 量化 Benchmark (精简版 / 业界标准三件套)
 ================================================
 
 只保留推理服务领域 (vLLM / TensorRT-LLM / SGLang) 标准评测三大维度：
@@ -330,6 +330,94 @@ def run_latency_throughput_benchmark():
 
 
 # ======================================================================
+# 模块 2.5: 多并发吞吐 (Concurrent Throughput)  —— 量化吞吐收益的真正来源
+# ======================================================================
+def run_concurrency_benchmark():
+    """
+    多并发吞吐评测：在不同 batch_size 下对比三种模式的端到端总吞吐。
+
+    业界 fp8 KV cache 的吞吐提升核心来自【容量】而非【单 step 计算】：
+      - fp8 KV cache 占用减半 -> 相同显存能装更多并发请求
+      - batch 越大 -> 每 step 摊到每请求的开销越低 -> 总吞吐越高
+
+    batch=1 时几乎看不到差异（计算瓶颈）；batch 增大后差异才会拉开。
+    """
+    print("\n" + "=" * 70)
+    print(f"模块 2.5: 多并发吞吐 (Concurrent Throughput)   [{FP8_FORMAT}]")
+    print("=" * 70)
+
+    from myvllm.sampling_parameters import SamplingParams
+
+    # 测试 batch 阶梯：覆盖单请求到中等并发
+    batch_sizes = [1, 4, 8]
+    prompt_len = 128
+    gen_tokens = 32
+
+    headers = ["模式", "batch=1 (tok/s)", "batch=4 (tok/s)", "batch=8 (tok/s)", "batch=8/batch=1 加速比"]
+    rows = []
+    # 详细数据: {mode: {bs: tps}}
+    detail = {}
+
+    for mode in QUANT_MODES:
+        detail[mode] = {}
+        for bs in batch_sizes:
+            # 重新加载引擎避免上一轮 batch 状态污染
+            engine, tokenizer = load_engine(mode, max_model_length=512)
+            sp = SamplingParams(temperature=1e-6, max_tokens=gen_tokens, max_model_length=512)
+            prompt = chat_prompt(tokenizer, _gen_prompt_of_len(tokenizer, prompt_len))
+            prompts = [prompt] * bs
+
+            # warmup
+            warm_sp = SamplingParams(temperature=1e-6, max_tokens=4, max_model_length=512)
+            engine.generate([prompt], warm_sp)
+
+            # 计时整个 generate（prefill + decode），衡量总吞吐
+            torch.cuda.synchronize()
+            t0 = time.time()
+            out = engine.generate(prompts, sp)
+            torch.cuda.synchronize()
+            elapsed = time.time() - t0
+
+            # 总生成 token 数 = sum(每条 completion 长度)
+            total_gen_tokens = sum(
+                max(0, len(ids) - len(tokenizer.encode(prompt))) for ids in out['token_ids']
+            )
+            # 退化保护：若 token 统计异常，用 bs*gen_tokens 估算
+            if total_gen_tokens <= 0:
+                total_gen_tokens = bs * gen_tokens
+            tps = total_gen_tokens / elapsed if elapsed > 0 else float("nan")
+            detail[mode][bs] = tps
+            free_engine(engine)
+
+        speedup = (detail[mode][batch_sizes[-1]] / detail[mode][batch_sizes[0]]
+                   if detail[mode][batch_sizes[0]] > 0 else float("nan"))
+        rows.append([mode] +
+                    [f"{detail[mode][bs]:.1f}" for bs in batch_sizes] +
+                    [f"{speedup:.2f}x"])
+
+    save_table("concurrency_throughput", headers, rows)
+
+    if _HAS_MPL:
+        # 一张图: 每种模式一条 batch -> tps 曲线
+        fig, ax = plt.subplots(figsize=(8, 5))
+        for i, mode in enumerate(QUANT_MODES):
+            ys = [detail[mode][bs] for bs in batch_sizes]
+            ax.plot(batch_sizes, ys, marker="o", color=MODE_COLORS[i], label=mode)
+        ax.set_xlabel("batch size (concurrent requests)")
+        ax.set_ylabel("end-to-end throughput (tokens / s)")
+        ax.set_title(f"Concurrent throughput vs batch size ({FP8_FORMAT})")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        out = RESULT_DIR / "concurrency_throughput.png"
+        fig.tight_layout()
+        fig.savefig(out, dpi=120)
+        plt.close(fig)
+        print(f"  -> 图已保存: {out.name}")
+
+    return detail
+
+
+# ======================================================================
 # 模块 3: 精度 (Accuracy)
 # ======================================================================
 def run_accuracy_benchmark():
@@ -471,7 +559,7 @@ def main():
     parser = argparse.ArgumentParser(description="KV Cache FP8 量化 Benchmark (精简版)")
     parser.add_argument(
         "--suite", default="all",
-        help="评测模块, 逗号分隔: memory,latency,accuracy 或 all",
+        help="评测模块, 逗号分隔: memory,latency,concurrency,accuracy 或 all",
     )
     args = parser.parse_args()
 
@@ -479,7 +567,7 @@ def main():
 
     suite = args.suite.strip().lower()
     if suite == "all":
-        selected = {"memory", "latency", "accuracy"}
+        selected = {"memory", "latency", "concurrency", "accuracy"}
     else:
         selected = {s.strip() for s in suite.split(",")}
 
@@ -491,12 +579,15 @@ def main():
         mem_res = run_memory_benchmark()
     if "latency" in selected:
         lat_res = run_latency_throughput_benchmark()
+    if "concurrency" in selected:
+        run_concurrency_benchmark()
     if "accuracy" in selected:
         acc_res = run_accuracy_benchmark()
 
     plot_summary(mem_res, lat_res, acc_res)
 
     print("\n完成。所有表格(.md/.csv)与图(.png)见 benchmark_results/")
+    print("简历配图建议用 benchmark_results/summary.png (一图四指标)")
 
 
 if __name__ == "__main__":

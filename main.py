@@ -54,7 +54,10 @@ config = {
     'gpu_memory_utilization': 0.9,         # GPU显存使用比例（0~1）
 
     # kv cache量化
-    'kv_cache_dtype': 'fp8_per_token_head',
+    'kv_cache_dtype': 'kivi_2bit',        # 或 'kivi_4bit'
+    'kivi_group_size': 32,
+    'kivi_residual_length': 128,
+    'enforce_eager': True,                # KIVI 不走 CUDA Graph
 
     # EOS token ID
     'eos': 151645,                         # End-of-Sequence token的ID

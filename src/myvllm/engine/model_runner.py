@@ -87,6 +87,11 @@ class ModelRunner:
         # Debug flag for first decode step
         self._first_decode = False
 
+        # KIVI: seq_id -> residual_slot 的稳定映射；每条运行中的序列分配一行 residual buffer
+        # 在 prepare_prefill / prepare_decode 中按需 acquire / release
+        self._kivi_seq_to_slot: dict[int, int] = {}
+        self._kivi_free_slots: list[int] = []
+
         # warm up model so that we know peak memory usage
         self.warmup_model()
         # allocate kv cache
@@ -213,11 +218,24 @@ class ModelRunner:
         #   "auto"               -> 不量化，使用默认精度 (fp16/bf16)
         #   "fp8_per_tensor"     -> FP8 量化，整个 cache 共享一组 (K/V 各一个) 标量 scale
         #   "fp8_per_token_head" -> FP8 量化，每个 (token, kv_head) 组合独立一个 scale (对齐 vLLM)
+        #   "kivi_2bit"          -> KIVI 2-bit 量化 (K per-channel-per-block / V per-token-per-head + fp16 residual)
+        #   "kivi_4bit"          -> KIVI 4-bit 量化 (同上, bit-width 不同)
         # 参考 vLLM 的 KVQuantMode，per_token_head 精度更高、对离群值更鲁棒。
         self.kv_cache_dtype = self.config.get('kv_cache_dtype', 'auto')
         # 是否启用 fp8 量化
         self.kv_quant_enabled = self.kv_cache_dtype != 'auto'
-        if self.kv_quant_enabled:
+        # 是否启用 KIVI 量化路径
+        self.kivi_enabled = self.kv_cache_dtype.startswith('kivi')
+        # KIVI 超参数 (仅 KIVI 路径生效)
+        self.kivi_bits = 2 if self.kv_cache_dtype == 'kivi_2bit' else (4 if self.kv_cache_dtype == 'kivi_4bit' else 0)
+        self.kivi_group_size = int(self.config.get('kivi_group_size', 32))      # K 沿 head_dim 的分组宽度
+        self.kivi_residual_length = int(self.config.get('kivi_residual_length', 128))  # fp16 buffer 容量
+
+        if self.kivi_enabled:
+            # KIVI: 量化值用 int8 容器装载 (2-bit/4-bit 占低 bit; 不在分配阶段做 bit-pack, kernel 内逐元素读取)
+            # 这样 cache shape 与 fp16 完全一致，便于把 paged attention 的索引计算复用
+            kv_data_dtype = torch.int8
+        elif self.kv_quant_enabled:
             # FP8 e4m3fn: 1 字节/元素, 数值范围 [-448, 448]
             kv_data_dtype = torch.float8_e4m3fn
         else:
@@ -234,6 +252,16 @@ class ModelRunner:
         # 额外开销 = block_size * 2(K和V) * num_layers * num_kv_heads * 4(float32)
         if self.kv_cache_dtype == 'fp8_per_token_head':
             block_bytes += self.block_size * 2 * num_layers * num_kv_heads * 4
+        if self.kivi_enabled:
+            # KIVI 每个 block 额外开销 (按 fp32=4 bytes 计算):
+            # - K scale + K zero: 2 * num_layers * block_size * num_kv_heads * (head_dim/group_size) * 4 bytes
+            # - V scale         : num_layers * block_size * num_kv_heads * 4 bytes
+            #   (V 只需 scale 不需 zero, 因 KIVI 中 V 用对称量化)
+            assert head_dim % self.kivi_group_size == 0, \
+                f"head_dim {head_dim} 必须能被 kivi_group_size {self.kivi_group_size} 整除"
+            n_groups = head_dim // self.kivi_group_size
+            block_bytes += num_layers * self.block_size * num_kv_heads * n_groups * 2 * 4   # K scale+zero
+            block_bytes += num_layers * self.block_size * num_kv_heads * 4  # V scale
         num_available_kv_blocks = int(available_mem // block_bytes)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         
@@ -280,6 +308,10 @@ class ModelRunner:
         # scale 始终用 float32 存储，反量化时: x_fp16 = x_fp8.to(float) * scale
         allocated_k_scale = None
         allocated_v_scale = None
+        # KIVI 量化使用的额外张量 (K 用非对称, 需 zero; V 用对称, scale 即可)
+        allocated_k_zero = None
+        allocated_k_residual = None
+        allocated_v_residual = None
         if self.kv_cache_dtype == 'fp8_per_tensor':
             # per_tensor: 每层 K/V 各一个全局标量 scale
             # 形状: (2, num_layers, 1)，最后一维为 1 便于广播
@@ -295,6 +327,41 @@ class ModelRunner:
             )
             allocated_k_scale = scale_buf[0]
             allocated_v_scale = scale_buf[1]
+        elif self.kivi_enabled:
+            # ============ KIVI 量化的 scale / zero / residual 分配 ============
+            # K: per-token-per-channel-group 非对称量化 (即每个 (block, slot, kv_head, group) 一组 scale/zero)
+            #   shape: (num_layers, max_cached_blocks, block_size, num_kv_heads, head_dim/group_size)
+            # BUG FIX: 原方案 shape 缺少 block_size 维 -> 同一块内不同 token 互相覆盖 scale/zero,
+            #          decode 读到的几乎全是最后一个写入 token 的 scale, 导致输出乱码。
+            n_groups = head_dim // self.kivi_group_size
+            allocated_k_scale = torch.ones(
+                num_layers, max_cached_blocks, self.block_size, num_kv_heads, n_groups,
+                dtype=torch.float32, device=f'cuda:{self.rank}'
+            )
+            allocated_k_zero = torch.zeros(
+                num_layers, max_cached_blocks, self.block_size, num_kv_heads, n_groups,
+                dtype=torch.float32, device=f'cuda:{self.rank}'
+            )
+            # V: per-token-per-head 对称量化, 与 fp8_per_token_head 同布局
+            #   shape: (num_layers, max_cached_blocks, block_size, num_kv_heads)
+            allocated_v_scale = torch.ones(
+                num_layers, max_cached_blocks, self.block_size, num_kv_heads,
+                dtype=torch.float32, device=f'cuda:{self.rank}'
+            )
+            # residual buffer: 每条 (运行中) 序列的尾部 fp16 缓冲, 不参与 paging
+            #   shape: (num_layers, max_num_seqs, residual_length, num_kv_heads, head_dim)
+            # 用 max_num_sequences 作为 seq slot 数上限; 每条 seq 通过 prepare_xxx 传 residual_slots 拿到自己的行
+            max_num_seqs = int(self.config.get('max_num_sequences', 16))
+            self.kivi_max_num_seqs = max_num_seqs
+            residual_dtype = self.default_dtype
+            allocated_k_residual = torch.zeros(
+                num_layers, max_num_seqs, self.kivi_residual_length, num_kv_heads, head_dim,
+                dtype=residual_dtype, device=f'cuda:{self.rank}'
+            )
+            allocated_v_residual = torch.zeros(
+                num_layers, max_num_seqs, self.kivi_residual_length, num_kv_heads, head_dim,
+                dtype=residual_dtype, device=f'cuda:{self.rank}'
+            )
 
         # 将 data / scale 张量按层下发到每个 attention 模块
         layer_id = 0
@@ -308,7 +375,38 @@ class ModelRunner:
                 if allocated_k_scale is not None:
                     module.k_scale = allocated_k_scale[layer_id]
                     module.v_scale = allocated_v_scale[layer_id]
+                # KIVI 额外注入 zero / residual / 超参
+                if self.kivi_enabled:
+                    module.k_zero = allocated_k_zero[layer_id]
+                    module.k_residual = allocated_k_residual[layer_id]
+                    module.v_residual = allocated_v_residual[layer_id]
+                    module.kivi_bits = self.kivi_bits
+                    module.kivi_group_size = self.kivi_group_size
+                    module.kivi_residual_length = self.kivi_residual_length
                 layer_id += 1
+
+    # ============ KIVI residual buffer slot 管理 ============
+    # 每条运行中的序列在 residual buffer 中独占一行；序列结束(从此 method 调用方再也看不到)时回收。
+    # 简单实现: 用一个 set 跟踪当前批中的 seq_id, 把不在批中的 slot 回收回空闲池。
+    def _kivi_get_slots_for_seqs(self, seqs: list[Sequence]) -> list[int]:
+        if not getattr(self, 'kivi_enabled', False):
+            return []
+        # 初始化空闲池
+        if not self._kivi_free_slots and not self._kivi_seq_to_slot:
+            self._kivi_free_slots = list(range(self.kivi_max_num_seqs))
+        current_ids = {seq.seq_id for seq in seqs}
+        # 回收: 不再出现在批里的 seq 对应 slot 释放
+        stale = [sid for sid in self._kivi_seq_to_slot if sid not in current_ids]
+        for sid in stale:
+            self._kivi_free_slots.append(self._kivi_seq_to_slot.pop(sid))
+        # 分配
+        slots: list[int] = []
+        for seq in seqs:
+            if seq.seq_id not in self._kivi_seq_to_slot:
+                assert self._kivi_free_slots, "KIVI residual slot 不足: 请增大 max_num_sequences"
+                self._kivi_seq_to_slot[seq.seq_id] = self._kivi_free_slots.pop()
+            slots.append(self._kivi_seq_to_slot[seq.seq_id])
+        return slots
 
     # given seqs
     # prepare the data needed for a prefill forward pass
@@ -359,6 +457,24 @@ class ModelRunner:
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
 
+        # ============ KIVI: 为每个 token 准备 residual_slot ============
+        # prefill 阶段把 (num_tokens,) 的 residual_slot 与 token 序列对齐：
+        #   每条 seq 的所有"新写入" token 共享同一个 residual_slot (= 该 seq 在 residual buffer 中的行号)
+        residual_slots_tensor = None
+        residual_lens_tensor = None
+        if getattr(self, 'kivi_enabled', False):
+            seq_slots = self._kivi_get_slots_for_seqs(seqs)
+            per_token_slot: list[int] = []
+            per_seq_residual_len: list[int] = []
+            for seq, slot in zip(seqs, seq_slots):
+                # 当前 seq 在本次 prefill 中要写入的 token 数
+                new_n = len(seq.token_ids) - seq.num_cached_tokens
+                per_token_slot.extend([slot] * new_n)
+                # prefill 起始时 residual 长度为 num_cached_tokens (前缀命中可能不为 0)
+                per_seq_residual_len.append(seq.num_cached_tokens)
+            residual_slots_tensor = torch.tensor(per_token_slot, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            residual_lens_tensor = torch.tensor(per_seq_residual_len, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
         set_context(
             is_prefill=True,
             cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
@@ -368,6 +484,8 @@ class ModelRunner:
             slot_mapping=slot_mapping_tensor,
             context_lens=None,
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            residual_slots=residual_slots_tensor,
+            residual_lens=residual_lens_tensor,
         )
         return input_ids
 
@@ -388,6 +506,19 @@ class ModelRunner:
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        # KIVI: decode 阶段每条 seq 一个 token, residual_slots 形状 (num_seqs,)
+        # residual_lens = 当前 seq 在 residual buffer 里 *已经* 写入了多少 token (不含本步)
+        residual_slots_tensor = None
+        residual_lens_tensor = None
+        if getattr(self, 'kivi_enabled', False):
+            seq_slots = self._kivi_get_slots_for_seqs(seqs)
+            # 本步 token 写入前的 residual 长度 = (序列总长 - 1) % residual_length
+            # 这里采用最简策略: 我们让 residual buffer 始终承接尾部 (序列长度 - paged_in_kv_tokens) 个 token,
+            # 但为最小可跑实现, 直接用 (num_tokens - 1) 作为写入索引 (mod residual_length)
+            residual_lens = [(len(seq) - 1) % self.kivi_residual_length for seq in seqs]
+            residual_slots_tensor = torch.tensor(seq_slots, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            residual_lens_tensor = torch.tensor(residual_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
         set_context(
             is_prefill=False,
             cu_seqlens_q=None,
@@ -397,6 +528,8 @@ class ModelRunner:
             slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            residual_slots=residual_slots_tensor,
+            residual_lens=residual_lens_tensor,
         )
         return input_ids    
 
