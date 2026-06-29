@@ -1,0 +1,4 @@
+模式,token一致率 (vs fp16),解读
+auto,1.000,fp16 基线
+fp8_per_tensor,0.490,精度显著退化
+fp8_per_token_head,0.750,精度显著退化
