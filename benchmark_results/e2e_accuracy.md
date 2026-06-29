@@ -1,0 +1,11 @@
+| 模式 | 样本 | Top-1一致率 | 首次分歧位置 |
+|---|---|---|---|
+| auto | #0 | 1.000 | 64 |
+| auto | #1 | 1.000 | 64 |
+| auto | #2 | 1.000 | 64 |
+| fp8_per_tensor | #0 | 0.562 | 36 |
+| fp8_per_tensor | #1 | 0.906 | 58 |
+| fp8_per_tensor | #2 | 0.062 | 4 |
+| fp8_per_token_head | #0 | 0.938 | 60 |
+| fp8_per_token_head | #1 | 0.266 | 17 |
+| fp8_per_token_head | #2 | 0.391 | 25 |

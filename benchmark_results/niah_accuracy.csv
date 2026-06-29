@@ -1,0 +1,13 @@
+模式,ctx_len,depth=0.1,depth=0.3,depth=0.5,depth=0.7,depth=0.9,平均
+auto,128,0,0,0,0,0,0.00
+auto,256,0,0,0,0,0,0.00
+auto,512,0,0,0,0,0,0.00
+auto,768,0,0,0,0,0,0.00
+fp8_per_tensor,128,0,0,0,0,0,0.00
+fp8_per_tensor,256,0,0,0,0,0,0.00
+fp8_per_tensor,512,0,0,0,0,0,0.00
+fp8_per_tensor,768,0,0,0,0,0,0.00
+fp8_per_token_head,128,0,0,0,0,0,0.00
+fp8_per_token_head,256,0,0,0,0,0,0.00
+fp8_per_token_head,512,0,0,0,0,0,0.00
+fp8_per_token_head,768,0,0,0,0,0,0.00
