@@ -12,6 +12,7 @@ class Context:
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
     # KIVI 量化路径需要用到的额外字段：
     # - residual_slots: (num_tokens,) 每个 token 在 fp16 residual 缓冲中的行号
     #   prefill 时 token 顺序展开；decode 时每个序列一个 slot
@@ -30,9 +31,9 @@ def reset_context():
     _context = Context()
 
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0,
-                slot_mapping=None, context_lens=None, block_tables=None,
+                slot_mapping=None, context_lens=None, block_tables=None, positions=None,
                 residual_slots=None, residual_lens=None):
     global _context
     _context = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-                       slot_mapping, context_lens, block_tables,
+                       slot_mapping, context_lens, block_tables, positions,
                        residual_slots, residual_lens)

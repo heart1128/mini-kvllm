@@ -1,4 +1,5 @@
 import atexit
+import torch
 import torch.distributed as dist
 import time
 import torch.multiprocessing as mp
@@ -49,7 +50,8 @@ class LLMEngine:
             max_num_batched_tokens=config.get("max_num_batched_tokens", 1024),
             max_cached_blocks=config.get("max_cached_blocks", 1024),
             block_size=config.get("block_size", 256),
-            eos=config.get("eos", 50256)
+            eos=config.get("eos", 50256),
+            enable_chunked_prefill=config.get("enable_chunked_prefill", True),
         )
 
         atexit.register(self.exit)
@@ -64,6 +66,8 @@ class LLMEngine:
         self.model_runner = None
         for process in self.processes:
             process.join()
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     # call scheduler to schedule the next batch
     # return scheduled sequences and whether it is for prefilling
@@ -72,17 +76,18 @@ class LLMEngine:
     def step(self) -> tuple[list[int], bool]:
         scheduled_sequences, is_prefill = self.scheduler.schedule()
         if not scheduled_sequences:
-            return [], is_prefill
+            return [], 0, is_prefill
         # run the model
         outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
         # Move outputs to CPU and convert them to a list
         if outputs is not None:
             outputs = outputs.cpu().tolist()
         # postprocess the outputs
-        self.scheduler.postprocess(scheduled_sequences, outputs)
+        self.scheduler.postprocess(scheduled_sequences, outputs or [])
 
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        finished = [item.seq for item in scheduled_sequences if item.seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
+        num_processed_tokens = sum(item.num_scheduled_tokens for item in scheduled_sequences)
 
         return outputs, num_processed_tokens, is_prefill
 

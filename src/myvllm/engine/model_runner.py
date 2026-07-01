@@ -10,6 +10,7 @@ from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
+from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.utils import *
 
 class ModelRunner:
@@ -229,7 +230,7 @@ class ModelRunner:
         # KIVI 超参数 (仅 KIVI 路径生效)
         self.kivi_bits = 2 if self.kv_cache_dtype == 'kivi_2bit' else (4 if self.kv_cache_dtype == 'kivi_4bit' else 0)
         self.kivi_group_size = int(self.config.get('kivi_group_size', 32))      # K 沿 head_dim 的分组宽度
-        self.kivi_residual_length = int(self.config.get('kivi_residual_length', 128))  # fp16 buffer 容量
+        self.kivi_residual_length = int(self.config.get('kivi_residual_length', 32))  # fp16 buffer 容量
 
         if self.kivi_enabled:
             # KIVI: 量化值用 int8 容器装载 (2-bit/4-bit 占低 bit; 不在分配阶段做 bit-pack, kernel 内逐元素读取)
@@ -299,6 +300,8 @@ class ModelRunner:
         # KV cache data 张量：dtype 由 kv_data_dtype 决定 (fp8 量化时为 float8_e4m3fn)
         # 形状: (2, num_layers, max_cached_blocks, block_size, num_kv_heads, head_dim)
         #       第 0 维 2 表示 K(=0) 和 V(=1)
+
+        # 这里是分配kv cache的张量，后面分配scale的张量
         allocated_kv_cache = torch.zeros(
             2, num_layers, max_cached_blocks, self.block_size, num_kv_heads, head_dim,
             dtype=kv_data_dtype, device=f'cuda:{self.rank}'
@@ -490,6 +493,78 @@ class ModelRunner:
         return input_ids
 
 
+    def prepare_mixed(self, scheduled_items: list[ScheduledSequence]) -> torch.Tensor:
+        input_ids = []
+        slot_mappings = []
+        seqlens_q = []
+        seqlens_k = []
+        context_lens = []
+        positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        block_tables = []
+        seqs = [item.seq for item in scheduled_items]
+
+        for item in scheduled_items:
+            seq = item.seq
+            if seq.num_computed_tokens < seq.num_prompt_tokens:
+                start = max(seq.num_cached_tokens, seq.num_computed_tokens)
+                end = start + item.num_scheduled_tokens
+                input_ids.extend(seq.token_ids[start:end])
+            else:
+                start = seq.num_tokens - 1
+                end = seq.num_tokens
+                input_ids.append(seq.last_token)
+
+            seqlens_q.append(item.num_scheduled_tokens)
+            seqlens_k.append(end)
+            context_lens.append(end)
+            cu_seqlens_q.append(cu_seqlens_q[-1] + item.num_scheduled_tokens)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + end)
+
+            positions.extend(range(start, end))
+            for token_idx in range(start, end):
+                block_idx = token_idx // self.block_size
+                block_offset = token_idx % self.block_size
+                slot_mappings.append(seq.block_table[block_idx] * self.block_size + block_offset)
+
+        max_num_blocks = max(len(seq.block_table) for seq in seqs)
+        for seq in seqs:
+            block_tables.append(seq.block_table + [-1] * (max_num_blocks - len(seq.block_table)))
+
+        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+
+        residual_slots_tensor = None
+        residual_lens_tensor = None
+        if getattr(self, 'kivi_enabled', False):
+            seq_slots = self._kivi_get_slots_for_seqs(seqs)
+            per_token_slot = []
+            for item, slot in zip(scheduled_items, seq_slots):
+                per_token_slot.extend([slot] * item.num_scheduled_tokens)
+            residual_slots_tensor = torch.tensor(per_token_slot, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            residual_lens_tensor = torch.tensor(
+                [item.seq.num_computed_tokens for item in scheduled_items],
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+
+        set_context(
+            is_prefill=True,
+            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            max_seqlen_q=max(seqlens_q),
+            max_seqlen_k=max(seqlens_k),
+            slot_mapping=slot_mapping_tensor,
+            context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            positions=torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            residual_slots=residual_slots_tensor,
+            residual_lens=residual_lens_tensor,
+        )
+        return input_ids
+
+
     # prepare input data for decoding
     def prepare_decode(self, seqs: list[Sequence]) -> torch.Tensor:
         input_ids = []
@@ -574,16 +649,38 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        if is_prefill:
-            input_ids = self.prepare_prefill(seqs)
+    def run(self, seqs: list[ScheduledSequence] | list[Sequence], is_prefill: bool) -> list[int]:
+        if seqs and isinstance(seqs[0], ScheduledSequence):
+            scheduled_items = seqs
+            raw_seqs = [item.seq for item in scheduled_items]
+            decode_items = [item for item in scheduled_items if item.seq.num_computed_tokens >= item.seq.num_prompt_tokens]
+            decode_only = bool(decode_items) and len(decode_items) == len(scheduled_items)
+            if decode_only:
+                input_ids = self.prepare_decode(raw_seqs)
+                logits = self.run_model(input_ids, False)
+                sample_seqs = raw_seqs
+            else:
+                input_ids = self.prepare_mixed(scheduled_items)
+                logits = self.run_model(input_ids, True)
+                sample_indices = [
+                    i for i, item in enumerate(scheduled_items)
+                    if item.seq.num_computed_tokens + item.num_scheduled_tokens >= item.seq.num_prompt_tokens
+                ]
+                logits = logits[sample_indices] if sample_indices else None
+                sample_seqs = [scheduled_items[i].seq for i in sample_indices]
         else:
-            input_ids = self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, is_prefill)
+            raw_seqs = seqs
+            if is_prefill:
+                input_ids = self.prepare_prefill(raw_seqs)
+            else:
+                input_ids = self.prepare_decode(raw_seqs)
+            logits = self.run_model(input_ids, is_prefill)
+            sample_seqs = raw_seqs
+
         # only sample when rank == 0
         token_ids = None
-        if self.rank == 0:
-            token_ids = self.sampler(logits, self.prepare_sample(seqs))
+        if self.rank == 0 and logits is not None and sample_seqs:
+            token_ids = self.sampler(logits, self.prepare_sample(sample_seqs))
         reset_context()
         return token_ids
 

@@ -206,7 +206,9 @@ class Qwen3DecoderLayer(nn.Module):
         # Compute positions based on context (respecting sequence boundaries for batched prefill)
         from myvllm.utils import get_context
         context = get_context()
-        if context.is_prefill and context.cu_seqlens_q is not None:
+        if context.positions is not None:
+            positions = context.positions
+        elif context.is_prefill and context.cu_seqlens_q is not None:
             # For batched prefill, create positions that restart at 0 for each sequence
             positions = []
             cu_seqlens = context.cu_seqlens_q.cpu().tolist()

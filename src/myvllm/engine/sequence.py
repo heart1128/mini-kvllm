@@ -14,7 +14,7 @@ class SequenceStatus(Enum):
 class Sequence:
     counter = count()
 
-    def __init__(self, token_ids: list[int], block_size: int, sampling_params = SamplingParams()):
+    def __init__(self, token_ids: list[int], block_size: int = 4, sampling_params = SamplingParams()):
         self.block_size = block_size # number of tokens per block
         # record sequence id
         self.seq_id = next(Sequence.counter)
@@ -29,6 +29,7 @@ class Sequence:
         self.num_prompt_tokens = len(self.token_ids)
         # num_cached_tokens = 0
         self.num_cached_tokens = 0
+        self.num_computed_tokens = 0
         # block_table
         self.block_table = []
         # sampling_params' related things
@@ -50,6 +51,14 @@ class Sequence:
     @property
     def num_completion_tokens(self):
         return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def is_prefill_complete(self):
+        return self.num_computed_tokens >= self.num_prompt_tokens
+
+    @property
+    def num_tokens_to_compute(self):
+        return self.num_tokens - self.num_computed_tokens
 
     @property
     def prompt_token_ids(self):
@@ -90,19 +99,31 @@ class Sequence:
         return (
             self.num_tokens, 
             self.num_prompt_tokens, 
-            self.num_cached_tokens, 
+            self.num_cached_tokens,
+            self.num_computed_tokens,
             self.block_table,
             self.token_ids if self.num_completion_tokens == 0 else self.last_token
         )
 
     def __setstate__(self, state):
-        (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.num_cached_tokens,
-            self.block_table,
-            last_token_or_ids
-        ) = state
+        if len(state) == 5:
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                self.block_table,
+                last_token_or_ids
+            ) = state
+            self.num_computed_tokens = self.num_cached_tokens
+        else:
+            (
+                self.num_tokens,
+                self.num_prompt_tokens,
+                self.num_cached_tokens,
+                self.num_computed_tokens,
+                self.block_table,
+                last_token_or_ids
+            ) = state
         # Check if this is prefill (num_completion_tokens == 0) or decode phase
         num_completion_tokens = self.num_tokens - self.num_prompt_tokens
         if num_completion_tokens == 0:

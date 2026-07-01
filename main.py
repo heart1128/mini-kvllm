@@ -19,6 +19,7 @@ config = {
     'max_cached_blocks': 1024,            # KV缓存最大block数
     'block_size': 256,                    # 每个block包含的token数（KV缓存分配单位）
     'world_size': 1,                      # 分布式训练/推理的进程数
+    "enable_chunked_prefill": False,       # 是否启用分块预填充（Qwen3默认True）
 
     # 模型路径与运行模式
     'model_name_or_path': 'Qwen/Qwen3-0.6B',  # HuggingFace模型名称或本地路径
@@ -50,7 +51,7 @@ config = {
 
     # 引擎资源与生成限制
     'max_num_batch_tokens': 4096,          # 调度器单次调度的最大token数（prompt+generation）
-    'max_model_length': 128,               # 模型支持的最大序列长度（prompt + completion）
+    'max_model_length': 1024,               # 模型支持的最大序列长度（prompt + completion）
     'gpu_memory_utilization': 0.9,         # GPU显存使用比例（0~1）
 
     # kv cache量化
@@ -73,7 +74,7 @@ def main():
     # max_tokens is the max number of generated tokens
     # max_model_length is the max total length including prompt
     # both should be set in SamplingParams and help to determine when to stop generation
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=512)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=128, max_model_length=128)
     prompts = [
         "1+3等于多少",# * 15,
         "列出100以内的所有质数",# * 15,

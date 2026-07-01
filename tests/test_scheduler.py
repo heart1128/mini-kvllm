@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pytest
 from collections import deque
 from unittest.mock import MagicMock
-from myvllm.engine.scheduler import Scheduler
+from myvllm.engine.scheduler import Scheduler, ScheduledSequence
 from myvllm.engine.sequence import Sequence, SequenceStatus
 
 
@@ -14,6 +14,7 @@ def make_scheduler(
     max_num_sequences=10,
     max_cached_blocks=100,
     block_size=4,
+    enable_chunked_prefill=True,
 ):
     return Scheduler(
         max_num_sequences=max_num_sequences,
@@ -21,6 +22,7 @@ def make_scheduler(
         max_cached_blocks=max_cached_blocks,
         block_size=block_size,
         eos=0,
+        enable_chunked_prefill=enable_chunked_prefill,
     )
 
 
@@ -28,12 +30,13 @@ def inject_running(scheduler: Scheduler, *seqs: Sequence):
     """Put sequences directly into the running queue, bypassing prefill."""
     for seq in seqs:
         seq.status = SequenceStatus.RUNNING
+        seq.num_computed_tokens = seq.num_prompt_tokens
         scheduler.running.append(seq)
 
 
-def all_tracked(scheduler: Scheduler, scheduled: list[Sequence]) -> set:
+def all_tracked(scheduler: Scheduler, scheduled: list[ScheduledSequence]) -> set:
     """Return the set of all sequences the scheduler currently knows about."""
-    return set(scheduler.running) | set(scheduler.waiting) | set(scheduled)
+    return set(scheduler.running) | set(scheduler.waiting) | {item.seq for item in scheduled}
 
 
 class TestBug2TokenLimitBreak:
@@ -143,6 +146,118 @@ class TestBug1CanAppendFailure:
         assert seq_b in tracked, f"seq_b disappeared"
 
 
+class TestChunkedPrefillMixedScheduling:
+    def test_running_decode_is_scheduled_before_waiting_prefill(self):
+        scheduler = make_scheduler(max_num_batched_tokens=4, max_num_sequences=4)
+        running = Sequence([1, 2, 3])
+        running.num_computed_tokens = running.num_tokens
+        waiting = Sequence([4, 5, 6, 7, 8])
+        inject_running(scheduler, running)
+        scheduler.add_sequence(waiting)
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_append.return_value = True
+        scheduler.block_manager.append.return_value = None
+        scheduler.block_manager.can_allocate.return_value = True
+        scheduler.block_manager.allocate.return_value = None
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert [item.seq for item in scheduled] == [running, waiting]
+        assert [item.num_scheduled_tokens for item in scheduled] == [1, 3]
+        assert waiting.status == SequenceStatus.RUNNING
+        assert waiting in scheduler.running
+
+    def test_long_waiting_prompt_is_chunked_across_steps(self):
+        scheduler = make_scheduler(max_num_batched_tokens=3, max_num_sequences=2)
+        seq = Sequence([1, 2, 3, 4, 5, 6, 7])
+        scheduler.add_sequence(seq)
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_allocate.return_value = True
+        scheduler.block_manager.allocate.return_value = None
+
+        first, first_is_prefill = scheduler.schedule()
+        assert first_is_prefill
+        assert first == [ScheduledSequence(seq, 3)]
+
+        scheduler.postprocess(first, [])
+        assert seq.num_computed_tokens == 3
+        assert seq in scheduler.running
+
+        second, second_is_prefill = scheduler.schedule()
+        assert second_is_prefill
+        assert second == [ScheduledSequence(seq, 3)]
+
+    def test_partial_prefill_postprocess_does_not_append_token(self):
+        scheduler = make_scheduler(max_num_batched_tokens=2)
+        seq = Sequence([1, 2, 3, 4])
+        seq.status = SequenceStatus.RUNNING
+        scheduled = [ScheduledSequence(seq, 2)]
+
+        scheduler.postprocess(scheduled, [])
+
+        assert seq.token_ids == [1, 2, 3, 4]
+        assert seq.num_computed_tokens == 2
+        assert seq.status == SequenceStatus.RUNNING
+
+    def test_final_prefill_chunk_appends_sampled_token(self):
+        scheduler = make_scheduler(max_num_batched_tokens=2)
+        seq = Sequence([1, 2, 3, 4])
+        seq.status = SequenceStatus.RUNNING
+        seq.num_computed_tokens = 2
+        scheduled = [ScheduledSequence(seq, 2)]
+
+        scheduler.postprocess(scheduled, [9])
+
+        assert seq.token_ids == [1, 2, 3, 4, 9]
+        assert seq.num_computed_tokens == 4
+        assert seq.status == SequenceStatus.RUNNING
+
+    def test_disabled_chunked_prefill_does_not_split_long_waiting_prompt(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=3,
+            max_num_sequences=2,
+            enable_chunked_prefill=False,
+        )
+        seq = Sequence([1, 2, 3, 4, 5])
+        scheduler.add_sequence(seq)
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_allocate.return_value = True
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert not is_prefill
+        assert scheduled == []
+        assert seq in scheduler.waiting
+        scheduler.block_manager.allocate.assert_not_called()
+
+    def test_disabled_chunked_prefill_keeps_prefill_only_when_prompt_fits(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=10,
+            max_num_sequences=4,
+            enable_chunked_prefill=False,
+        )
+        running = Sequence([1, 2, 3])
+        waiting = Sequence([4, 5, 6])
+        inject_running(scheduler, running)
+        scheduler.add_sequence(waiting)
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_allocate.return_value = True
+        scheduler.block_manager.allocate.return_value = None
+        scheduler.block_manager.can_append.return_value = True
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert scheduled == [ScheduledSequence(waiting, 3)]
+        assert running not in [item.seq for item in scheduled]
+        scheduler.block_manager.append.assert_not_called()
+
+
 class TestSchedulerHappyPath:
     def test_prefill_scheduled_first(self):
         scheduler = make_scheduler(max_num_batched_tokens=100, max_cached_blocks=50)
@@ -151,7 +266,7 @@ class TestSchedulerHappyPath:
 
         scheduled, is_prefill = scheduler.schedule()
         assert is_prefill
-        assert seq in scheduled
+        assert seq in [item.seq for item in scheduled]
         assert seq in scheduler.running
 
     def test_all_running_seqs_scheduled_when_budget_allows(self):

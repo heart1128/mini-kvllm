@@ -1,6 +1,11 @@
-import xxhash
-import numpy as np
+import hashlib
+from array import array
 from collections import deque
+
+try:
+    import xxhash
+except ModuleNotFoundError:
+    xxhash = None
 
 from myvllm.engine.sequence import Sequence
 
@@ -37,11 +42,19 @@ class BlockManager:
     # given token_ids, compute the hash value
     # use prefix_hash_value to compute the hash in a context-sensitive way
     def compute_hash(self, token_ids: list[int], prefix_hash_value: int) -> int:
-        h = xxhash.xxh64()
+        token_bytes = array('i', token_ids).tobytes()
+        if xxhash is not None:
+            h = xxhash.xxh64()
+            if prefix_hash_value != -1:
+                h.update(prefix_hash_value.to_bytes(8, 'little'))
+            h.update(token_bytes)
+            return h.intdigest()
+
+        h = hashlib.blake2b(digest_size=8)
         if prefix_hash_value != -1:
             h.update(prefix_hash_value.to_bytes(8, 'little'))
-        h.update(np.array(token_ids, dtype=np.int32).tobytes())
-        return h.intdigest()
+        h.update(token_bytes)
+        return int.from_bytes(h.digest(), 'little')
 
     # move this block to used list
     def _allocate_block(self, block_id: int) -> Block:
@@ -65,49 +78,37 @@ class BlockManager:
 
 
     def allocate(self, seq: Sequence) -> None:
-        # Prefix Caching 核心：检查每个 block 是否已有缓存
-        # 遍历序列的所有 block
         h = -1
         for i in range(seq.num_blocks):
             no_cache_found = False
 
-            # 获取第 i 个 block 的 token_ids
             token_ids = seq.block(i)
-            # 只有完整的 block 才计算 hash（用于缓存查找），部分填充的 block hash 为 -1
+            # only compute hash for full blocks, always -1 for partial blocks
             h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
-            # 通过 hash 查找是否已有缓存的 block
             block_id = self.hash_to_block_id.get(h, -1)
             
-            # 两种情况视为 cache miss：
-            # 1. hash 不存在（block_id == -1）
-            # 2. hash 存在但实际 token_ids 不同（hash 冲突）
+            # if cache miss or hash collision
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                no_cache_found = True 
+                no_cache_found = True
 
             if not no_cache_found:
-                # ========== Cache Hit ==========
-                # 更新序列的缓存统计
-                seq.num_cached_tokens += self.block_size  # 记录已缓存的 token 数
-                
-                # 更新 block 的引用计数，处理边界情况：
-                # hash 已存在但 block 还未被正式分配（可能在其他请求中刚计算完 hash）
+                # update sequence information
+                seq.num_cached_tokens += self.block_size # which == len(token_ids)
+                # update block information, considering the edge case that the block is not allocated yet but with hash code
                 if block_id not in self.used_block_ids:
                     block = self._allocate_block(block_id)
+                    block.ref_count = 1
                 else:
-                    # block 已被其他序列使用，增加引用计数
+                    # update block information
                     block = self.blocks[self.hash_to_block_id[h]]
                     block.ref_count += 1
             else:
-                # ========== Cache Miss ==========
-                # 从空闲列表中分配一个新 block
+                # cache miss
                 block = self._allocate_block(self.free_block_ids[0])
-                # 更新 block 的 hash 和 token_ids
+                block.ref_count = 1
                 block.update(h=h, token_ids=token_ids)
-                # 如果是完整 block（hash != -1），记录到 hash 表中供后续复用
                 if h != -1:
                     self.hash_to_block_id[h] = block.block_id
-            
-            # 将分配的 block_id 添加到序列的 block_table 中
             seq.block_table.append(block.block_id)
         
     def deallocate(self, seq: Sequence) -> None:
@@ -146,6 +147,7 @@ class BlockManager:
             # Previous block should be finalized
             assert self.blocks[last_block_for_seq_id].hash != -1
             block = self._allocate_block(self.free_block_ids[0])
+            block.ref_count = 1
             block_tables.append(block.block_id)
         # else, do nothing
         else:
