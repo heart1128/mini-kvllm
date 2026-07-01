@@ -54,9 +54,10 @@ config = {
     'gpu_memory_utilization': 0.9,         # GPU显存使用比例（0~1）
 
     # kv cache量化
-    'kv_cache_dtype': 'kivi_2bit',        # 或 'kivi_4bit'
-    'kivi_group_size': 32,
-    'kivi_residual_length': 128,
+    # 'kv_cache_dtype': 'kivi_4bit',        # 或 'kivi_4bit'
+    # 'kivi_group_size': 32,
+    # 'kivi_residual_length': 128,
+    'kv_cache_dtype': 'fp8_per_token_head',
     'enforce_eager': True,                # KIVI 不走 CUDA Graph
 
     # EOS token ID
@@ -72,11 +73,11 @@ def main():
     # max_tokens is the max number of generated tokens
     # max_model_length is the max total length including prompt
     # both should be set in SamplingParams and help to determine when to stop generation
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=128)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=256, max_model_length=512)
     prompts = [
         "1+3等于多少",# * 15,
-        "list all prime numbers within 100",# * 15,
-        "give me your opinion on the impact of artificial intelligence on society",# * 15,
+        "列出100以内的所有质数",# * 15,
+        "谈谈你对人工智能对社会影响的看法",# * 15,
     ] #* 30
     prompts = [
         tokenizer.apply_chat_template(
