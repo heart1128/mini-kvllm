@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import statistics
 import time
 from pathlib import Path
@@ -10,6 +11,9 @@ DEFAULT_CONFIG = {
     "max_num_sequences": 16,
     "max_num_batched_tokens": 1024,
     "max_num_batch_tokens": 4096,
+    "long_prefill_token_threshold": 0,
+    "max_num_partial_prefills": None,
+    "max_long_partial_prefills": None,
     "max_cached_blocks": 2048,
     "block_size": 256,
     "world_size": 1,
@@ -32,6 +36,34 @@ DEFAULT_CONFIG = {
     "max_model_length": 4096,
     "gpu_memory_utilization": 0.9,
     "eos": 151645,
+}
+
+
+def parse_optional_int(value: str) -> int | None:
+    if value.lower() in {"none", "null", "off"}:
+        return None
+    return int(value)
+
+
+POLICY_PRESETS: dict[str, dict[str, int | None]] = {
+    # 正常 chunked prefill：不额外限制单步 chunk size，也不限制 partial prefill 并发。
+    "default": {
+        "long_prefill_token_threshold": 0,
+        "max_num_partial_prefills": None,
+        "max_long_partial_prefills": None,
+    },
+    # 单步 chunk size 上限：限制单个长 prompt 每轮最多吃多少 prefill token budget。
+    "chunk_limit": {
+        "long_prefill_token_threshold": 512,
+        "max_num_partial_prefills": None,
+        "max_long_partial_prefills": None,
+    },
+    # 长短调度限制：在 chunk size 上限基础上，只允许少量 partial/long partial prefill 同时在 running 中。
+    "partial_limits": {
+        "long_prefill_token_threshold": 512,
+        "max_num_partial_prefills": 1,
+        "max_long_partial_prefills": 1,
+    },
 }
 
 
@@ -81,6 +113,9 @@ def scenario_prompts(name: str, short_words: int, long_words: int) -> list[tuple
     raise ValueError(f"Unknown scenario: {name}")
 
 
+# benchmark 中 non-chunked baseline 不能强行跑超预算长 prompt：
+# 关闭 chunk prefill 时，scheduler 要求整个 prompt 一次放入 max_num_batched_tokens。
+# 如果 prompt 超预算，这组没有可比结果，只能标记 skipped，否则主循环会无进展。
 def get_skip_reason(
     config: dict[str, Any],
     tokenizer: Any,
@@ -146,6 +181,8 @@ def run_engine_steps(
     tokenizer: Any,
     named_prompts: list[tuple[str, str]],
     max_output_tokens: int,
+    progress: bool = False,
+    max_steps: int | None = None,
 ) -> dict[str, Any]:
     from myvllm.engine.llm_engine import LLMEngine
     from myvllm.sampling_parameters import SamplingParams
@@ -158,6 +195,10 @@ def run_engine_steps(
     )
 
     rendered_prompts = make_chat_prompts(tokenizer, [prompt for _, prompt in named_prompts])
+    prompt_tokens = {
+        name: len(tokenizer(rendered_prompt, add_special_tokens=False)["input_ids"])
+        for (name, _), rendered_prompt in zip(named_prompts, rendered_prompts)
+    }
     seq_id_to_name = {}
     for (name, _), rendered_prompt in zip(named_prompts, rendered_prompts):
         engine.add_prompt(rendered_prompt, sampling_params)
@@ -173,10 +214,17 @@ def run_engine_steps(
         for name, _ in named_prompts
     }
 
+    # 计时从请求加入 scheduler 后开始，不包含模型加载和 KV cache 分配。
+    # progress/max_steps 是调试卡住场景用的：能区分 scheduler 无进展、Triton JIT 卡住、还是普通慢 step。
     start = time.perf_counter()
     step_records = []
     try:
         while not engine.scheduler.is_finished():
+            if max_steps is not None and len(step_records) >= max_steps:
+                raise RuntimeError(
+                    f"Benchmark exceeded --max-steps={max_steps}; "
+                    f"waiting={len(engine.scheduler.waiting)}, running={len(engine.scheduler.running)}"
+                )
             step_start = time.perf_counter()
             outputs, num_processed_tokens, is_prefill = engine.step()
             raise_if_no_progress(engine.scheduler, outputs, num_processed_tokens, config)
@@ -184,6 +232,15 @@ def run_engine_steps(
             step_end = time.perf_counter()
             elapsed = step_end - start
             step_time = step_end - step_start
+            if progress:
+                print(
+                    "step="
+                    f"{len(step_records)} elapsed={elapsed:.3f}s "
+                    f"step_time={step_time:.3f}s processed={num_processed_tokens} "
+                    f"prefill={is_prefill} waiting={len(engine.scheduler.waiting)} "
+                    f"running={len(engine.scheduler.running)} outputs={len(outputs)}",
+                    flush=True,
+                )
             step_records.append(
                 {
                     "elapsed_s": elapsed,
@@ -225,39 +282,85 @@ def run_engine_steps(
         "decode_tps": total_output_tokens / total_latency_s if total_latency_s > 0 else float("nan"),
         "mean_ttft_ms": statistics.mean(ttfts) * 1000 if ttfts else float("nan"),
         "mean_tpot_ms": statistics.mean(decode_times) * 1000 if decode_times else float("nan"),
+        "prompt_tokens": prompt_tokens,
         "per_request": per_request,
         "steps": step_records,
     }
 
 
-def summarize_result(scenario: str, enabled: bool, result: dict[str, Any]) -> dict[str, Any]:
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * pct) - 1))
+    return ordered[index]
+
+
+def summarize_result(
+    scenario: str,
+    enabled: bool,
+    result: dict[str, Any],
+    policy: str = "baseline",
+) -> dict[str, Any]:
+    per_request = result["per_request"]
+    prompt_tokens_by_name = result.get("prompt_tokens", {})
     short_ttfts = [
         req["ttft_s"] * 1000
-        for name, req in result["per_request"].items()
+        for name, req in per_request.items()
         if name.startswith("short") and req["ttft_s"] is not None
     ]
+    long_ttfts = [
+        req["ttft_s"] * 1000
+        for name, req in per_request.items()
+        if name.startswith("long") and req["ttft_s"] is not None
+    ]
+    steps = result.get("steps", [])
+    prefill_steps = sum(1 for step in steps if step.get("is_prefill"))
+    decode_steps = sum(1 for step in steps if not step.get("is_prefill"))
+    long_prompt_tokens = sum(
+        tokens for name, tokens in prompt_tokens_by_name.items() if name.startswith("long")
+    )
+    short_prompt_tokens = sum(
+        tokens for name, tokens in prompt_tokens_by_name.items() if name.startswith("short")
+    )
     return {
         "scenario": scenario,
+        "policy": policy,
         "chunked_prefill": enabled,
         "skipped": result.get("skipped", False),
         "skip_reason": result.get("skip_reason"),
         "ttft_ms": result["mean_ttft_ms"],
+        "long_ttft_ms": statistics.mean(long_ttfts) if long_ttfts else float("nan"),
+        "short_request_ttft_under_long_prefill_ms": statistics.mean(short_ttfts) if short_ttfts else float("nan"),
+        "short_p90_ttft_ms": percentile(short_ttfts, 0.9),
         "tpot_ms": result["mean_tpot_ms"],
         "total_latency_s": result["total_latency_s"],
         "decode_tps": result["decode_tps"],
-        "short_request_ttft_under_long_prefill_ms": statistics.mean(short_ttfts) if short_ttfts else float("nan"),
+        "prefill_steps": prefill_steps,
+        "decode_steps": decode_steps,
+        "prompt_tokens": sum(prompt_tokens_by_name.values()),
+        "long_prompt_tokens": long_prompt_tokens,
+        "short_prompt_tokens": short_prompt_tokens,
     }
 
 
 def print_table(rows: list[dict[str, Any]]) -> None:
     headers = [
         "scenario",
+        "policy",
         "chunked",
         "TTFT(ms)",
+        "long TTFT(ms)",
+        "short TTFT(ms)",
+        "short p90(ms)",
         "TPOT(ms)",
         "latency(s)",
         "decode tok/s",
-        "short TTFT(ms)",
+        "prefill steps",
+        "decode steps",
+        "prompt toks",
+        "long toks",
+        "short toks",
     ]
     print("| " + " | ".join(headers) + " |")
     print("| " + " | ".join(["---"] * len(headers)) + " |")
@@ -267,12 +370,20 @@ def print_table(rows: list[dict[str, Any]]) -> None:
             + " | ".join(
                 [
                     row["scenario"],
+                    row["policy"],
                     "on" if row["chunked_prefill"] else "off",
                     "skipped" if row.get("skipped") else f"{row['ttft_ms']:.2f}",
+                    "skipped" if row.get("skipped") else f"{row['long_ttft_ms']:.2f}",
+                    "skipped" if row.get("skipped") else f"{row['short_request_ttft_under_long_prefill_ms']:.2f}",
+                    "skipped" if row.get("skipped") else f"{row['short_p90_ttft_ms']:.2f}",
                     "skipped" if row.get("skipped") else f"{row['tpot_ms']:.2f}",
                     "skipped" if row.get("skipped") else f"{row['total_latency_s']:.2f}",
                     "skipped" if row.get("skipped") else f"{row['decode_tps']:.2f}",
-                    "skipped" if row.get("skipped") else f"{row['short_request_ttft_under_long_prefill_ms']:.2f}",
+                    "skipped" if row.get("skipped") else str(row["prefill_steps"]),
+                    "skipped" if row.get("skipped") else str(row["decode_steps"]),
+                    "skipped" if row.get("skipped") else str(row["prompt_tokens"]),
+                    "skipped" if row.get("skipped") else str(row["long_prompt_tokens"]),
+                    "skipped" if row.get("skipped") else str(row["short_prompt_tokens"]),
                 ]
             )
             + " |"
@@ -285,9 +396,32 @@ def main() -> None:
     parser.add_argument("--max-output-tokens", type=int, default=64)
     parser.add_argument("--max-num-batched-tokens", type=int, default=1024)
     parser.add_argument("--max-model-length", type=int, default=4096)
+    parser.add_argument(
+        "--policies",
+        default="default,chunk_limit,partial_limits",
+        help="Comma separated chunked policies: default,chunk_limit,partial_limits",
+    )
+    parser.add_argument(
+        "--long-prefill-token-threshold",
+        type=int,
+        default=None,
+        help="Override long prefill chunk size threshold for chunked policy runs; 0 disables the threshold",
+    )
+    parser.add_argument(
+        "--max-num-partial-prefills",
+        default="__unset__",
+        help="Override max partial prefill count; use none/null/off for unlimited",
+    )
+    parser.add_argument(
+        "--max-long-partial-prefills",
+        default="__unset__",
+        help="Override max long partial prefill count; use none/null/off for unlimited",
+    )
     parser.add_argument("--short-words", type=int, default=32)
     parser.add_argument("--long-words", type=int, default=1800)
     parser.add_argument("--output", default="results/chunk_prefill_benchmark.json")
+    parser.add_argument("--progress", action="store_true", help="Print per-step scheduler progress")
+    parser.add_argument("--max-steps", type=int, default=None, help="Abort a scenario after this many engine steps")
     parser.add_argument(
         "--scenarios",
         default="short_only,long_only,mixed_long_short",
@@ -317,28 +451,57 @@ def main() -> None:
     )
 
     scenarios = [item.strip() for item in args.scenarios.split(",") if item.strip()]
+    policies = [item.strip() for item in args.policies.split(",") if item.strip()]
+    unknown_policies = [policy for policy in policies if policy not in POLICY_PRESETS]
+    if unknown_policies:
+        raise ValueError(f"Unknown policies: {unknown_policies}; choose from {sorted(POLICY_PRESETS)}")
+
     raw_results = []
     summary_rows = []
     for scenario in scenarios:
         named_prompts = scenario_prompts(scenario, args.short_words, args.long_words)
-        for enabled in (False, True):
+        benchmark_runs: list[tuple[str, bool, dict[str, int | None]]] = [("baseline", False, {})]
+        benchmark_runs.extend((policy, True, dict(POLICY_PRESETS[policy])) for policy in policies)
+
+        for policy, enabled, policy_config in benchmark_runs:
             config = dict(base_config)
             config["enable_chunked_prefill"] = enabled
-            print(f"Running scenario={scenario}, chunked_prefill={enabled}")
+            if enabled:
+                if args.long_prefill_token_threshold is not None:
+                    policy_config["long_prefill_token_threshold"] = args.long_prefill_token_threshold
+                if args.max_num_partial_prefills != "__unset__":
+                    policy_config["max_num_partial_prefills"] = parse_optional_int(args.max_num_partial_prefills)
+                if args.max_long_partial_prefills != "__unset__":
+                    policy_config["max_long_partial_prefills"] = parse_optional_int(args.max_long_partial_prefills)
+                config.update(policy_config)
+
+            print(
+                f"Running scenario={scenario}, policy={policy}, "
+                f"chunked_prefill={enabled}, scheduler={policy_config}"
+            )
             skip_reason = get_skip_reason(config, tokenizer, named_prompts)
             if skip_reason is not None:
-                print(f"Skipping scenario={scenario}, chunked_prefill={enabled}: {skip_reason}")
+                print(f"Skipping scenario={scenario}, policy={policy}, chunked_prefill={enabled}: {skip_reason}")
                 result = skipped_result(skip_reason)
             else:
-                result = run_engine_steps(config, tokenizer, named_prompts, args.max_output_tokens)
+                result = run_engine_steps(
+                    config,
+                    tokenizer,
+                    named_prompts,
+                    args.max_output_tokens,
+                    progress=args.progress,
+                    max_steps=args.max_steps,
+                )
             raw_results.append(
                 {
                     "scenario": scenario,
+                    "policy": policy,
                     "chunked_prefill": enabled,
+                    "scheduler_config": policy_config,
                     "result": result,
                 }
             )
-            summary_rows.append(summarize_result(scenario, enabled, result))
+            summary_rows.append(summarize_result(scenario, enabled, result, policy=policy))
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

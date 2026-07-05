@@ -487,6 +487,7 @@ class ModelRunner:
             slot_mapping=slot_mapping_tensor,
             context_lens=None,
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            is_full_prefill=cu_seqlens_q[-1] == cu_seqlens_k[-1],
             residual_slots=residual_slots_tensor,
             residual_lens=residual_lens_tensor,
         )
@@ -503,25 +504,38 @@ class ModelRunner:
         cu_seqlens_q = [0]
         cu_seqlens_k = [0]
         block_tables = []
+        is_full_prefill_items = []
         seqs = [item.seq for item in scheduled_items]
 
         for item in scheduled_items:
             seq = item.seq
             if seq.num_computed_tokens < seq.num_prompt_tokens:
+                # prefill chunk：只把本轮 scheduler 切出的 prompt 片段送进模型。
+                # start 不能早于 prefix cache，也不能早于已经 forward 过的 chunk。
                 start = max(seq.num_cached_tokens, seq.num_computed_tokens)
                 end = start + item.num_scheduled_tokens
                 input_ids.extend(seq.token_ids[start:end])
             else:
+                # decode：模型只需要最新 token，但 attention 仍通过 block_tables/context_lens 读取完整 KV 历史。
                 start = seq.num_tokens - 1
                 end = seq.num_tokens
                 input_ids.append(seq.last_token)
 
+            # q 长度是本轮实际要算的新 token 数；k/context 长度是该 seq 当前可见的完整上下文长度。
+            # pure full prefill 必须从 0 开始，且本轮 q_len 覆盖完整 context；decode/chunk/extend 都不是 full prefill。
+            is_full_prefill_items.append(
+                seq.num_computed_tokens < seq.num_prompt_tokens
+                and start == 0
+                and item.num_scheduled_tokens == end
+            )
             seqlens_q.append(item.num_scheduled_tokens)
             seqlens_k.append(end)
             context_lens.append(end)
             cu_seqlens_q.append(cu_seqlens_q[-1] + item.num_scheduled_tokens)
             cu_seqlens_k.append(cu_seqlens_k[-1] + end)
 
+            # positions 是绝对位置，避免每个 chunk 的 RoPE 从 0 重新开始。
+            # slot_mapping 告诉 attention 当前新 token 的 K/V 应写入哪个 paged KV cache slot。
             positions.extend(range(start, end))
             for token_idx in range(start, end):
                 block_idx = token_idx // self.block_size
@@ -559,6 +573,7 @@ class ModelRunner:
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             positions=torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            is_full_prefill=all(is_full_prefill_items),
             residual_slots=residual_slots_tensor,
             residual_lens=residual_lens_tensor,
         )
@@ -650,19 +665,24 @@ class ModelRunner:
     # sample logits
     # reset context
     def run(self, seqs: list[ScheduledSequence] | list[Sequence], is_prefill: bool) -> list[int]:
+        # prefill chunk才会给ScheduledSequence，没有chunk时给Sequence
         if seqs and isinstance(seqs[0], ScheduledSequence):
             scheduled_items = seqs
             raw_seqs = [item.seq for item in scheduled_items]
             decode_items = [item for item in scheduled_items if item.seq.num_computed_tokens >= item.seq.num_prompt_tokens]
             decode_only = bool(decode_items) and len(decode_items) == len(scheduled_items)
             if decode_only:
+                # decode_only可以走decode的cuda graph加速
                 input_ids = self.prepare_decode(raw_seqs)
                 logits = self.run_model(input_ids, False)
                 sample_seqs = raw_seqs
             else:
+                # mixed batch 可能同时包含：长 prompt 的 prefill chunk、短 prompt 的完整 prefill、以及 decode token。
+                # 统一走 eager prefill 路径，因为 CUDA graph decode path 只覆盖纯 decode batch。
                 input_ids = self.prepare_mixed(scheduled_items)
                 logits = self.run_model(input_ids, True)
                 sample_indices = [
+                    # 只有已经完成 prompt 的 item 才需要采样；未完成的中间 chunk 只写 KV，不产 completion token。
                     i for i, item in enumerate(scheduled_items)
                     if item.seq.num_computed_tokens + item.num_scheduled_tokens >= item.seq.num_prompt_tokens
                 ]

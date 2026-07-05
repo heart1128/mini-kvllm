@@ -599,6 +599,201 @@ def paged_attention_prefill_torch(
 
 
 
+# chunked prefill/extend attention 使用的 Triton kernel。
+# 普通 full prefill 可以直接在当前 q/k/v 上做 varlen flash attention；
+# 但 chunked prefill 的后续 chunk 需要看见“之前 chunk 已经写入 paged KV cache 的历史 K/V”，
+# 因此这里按 block_tables 从 KV cache 读取完整可见上下文。
+@triton.jit
+def paged_attention_prefill_kernel(
+    output_ptr,
+    query_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    block_tables_ptr,
+    context_lens_ptr,
+    cu_seqlens_q_ptr,
+    positions_ptr,
+    scale: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_num_blocks: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    # Triton program id 的切分方式：
+    # - axis 0: 全局 query token 下标 q_idx，对应 query 张量的第 q_idx 行。
+    # - axis 1: attention head 下标 head_idx。
+    # - axis 2: batch 内 sequence 下标 seq_idx。
+    # 这种写法是 correctness-first：会为 (q_idx, head_idx, seq_idx) 的笛卡尔积启动 program，
+    # 再用 cu_seqlens_q 过滤掉不属于当前 seq 的 q_idx，因此会存在一些空 program。
+    q_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    seq_idx = tl.program_id(2)
+
+    # cu_seqlens_q 记录 mixed batch 中每个 seq 的 query token 范围。
+    # 例如 cu_seqlens_q=[0, 512, 513] 表示 seq0 有 512 个 q，seq1 有 1 个 q。
+    q_start = tl.load(cu_seqlens_q_ptr + seq_idx)
+    q_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
+    if q_idx < q_start or q_idx >= q_end:
+        return
+
+    # GQA/MQA 映射：多个 Q head 共享一个 KV head。
+    # 例如 num_heads=16, num_kv_heads=8 时，head 0/1 读 kv_head 0，head 2/3 读 kv_head 1。
+    kv_group_size = num_heads // num_kv_heads
+    kv_head_idx = head_idx // kv_group_size
+    context_len = tl.load(context_lens_ptr + seq_idx)
+    token_pos = tl.load(positions_ptr + q_idx)
+    # causal 可见长度：当前 query 的绝对位置是 token_pos，只能看见 [0, token_pos]。
+    # context_len 是该 seq 当前 KV cache 中已有/将有的上下文长度，取 min 防止越过有效上下文。
+    visible_len = tl.minimum(context_len, token_pos + 1)
+
+    # 读取当前 query 向量 Q[q_idx, head_idx, :]。
+    # head_dim 是 constexpr，因此 tl.arange(0, head_dim) 展开成一个向量化 load。
+    offs_d = tl.arange(0, head_dim)
+    q_offset = q_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    q = tl.load(query_ptr + q_offset)
+
+    # FlashAttention 的 online softmax 状态：
+    # - m_i: 已扫描 key token 的 running max，用于数值稳定。
+    # - l_i: 已扫描 key token 的 exp(score - m_i) 归一化分母。
+    # - acc: 已扫描 key token 的 sum(P * V) 累积值。
+    # 每扫描一个 BLOCK_N 的 key/value tile，就用新的局部 max 更新这三个状态。
+    acc = tl.zeros([head_dim], dtype=tl.float32)
+    l_i = 0.0
+    m_i = -3.4028234663852886e38
+    token_start = 0
+
+    # chunk prefill 下，当前 q/k/v 张量只包含“本轮新增 chunk”的 token。
+    # 但 attention 需要看见从 0 到 token_pos 的完整历史 KV，所以这里必须按 block_tables
+    # 从 paged KV cache 中逐段读取 K/V，而不能直接只用当前 chunk 的 k/v 做 flash attention。
+    # 这里的 while 按实际 visible_len 扫描，避免按 max_num_blocks 展开导致 Triton JIT 编译过大。
+    while token_start < visible_len:
+        # 当前 tile 覆盖的逻辑 token 下标范围：[token_start, token_start + BLOCK_N)。
+        # offs_n 是逻辑 token index，不是物理 cache slot。
+        offs_n = token_start + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < visible_len
+        # qk 保存当前 tile 内 BLOCK_N 个 key token 对当前 query 的 score。
+        # 不可见位置初始化为 -inf，后面 softmax 权重会变成 0。
+        qk = tl.zeros([BLOCK_N], dtype=tl.float32) - 3.4028234663852886e38
+
+        # 第一遍扫描当前 tile 的 K：计算 QK score。
+        # 当前实现为了简单，逐 token 找到 physical block，再向量化读取 head_dim。
+        # 逻辑 token -> block table -> physical KV block 的映射：
+        #   block_num = token_idx // block_size
+        #   block_offset = token_idx % block_size
+        #   physical_block_idx = block_tables[seq_idx, block_num]
+        for i in range(BLOCK_N):
+            token_idx = token_start + i
+            if token_idx < visible_len:
+                block_num = token_idx // block_size
+                block_offset = token_idx % block_size
+                block_table_offset = seq_idx * max_num_blocks + block_num
+                physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+                # physical_block_idx == -1 表示这个逻辑 block 无效/未分配，保持 score 为 -inf。
+                if physical_block_idx != -1:
+                    k_offset = (
+                        physical_block_idx * block_size * num_kv_heads * head_dim
+                        + block_offset * num_kv_heads * head_dim
+                        + kv_head_idx * head_dim
+                        + offs_d
+                    )
+                    k_vec = tl.load(k_cache_ptr + k_offset)
+                    # score = Q dot K * scale，这里的 scale 已经包含 1/sqrt(head_dim) 以及外部额外 scale。
+                    score = tl.sum(q * k_vec) * scale
+                    qk = tl.where(tl.arange(0, BLOCK_N) == i, score, qk)
+
+        # 对当前 tile 做局部 online softmax 更新。
+        # m_ij 是当前 tile 的最大 score；m_i_new 是历史 max 和当前 tile max 的合并值。
+        qk = tl.where(mask_n, qk, -3.4028234663852886e38)
+        m_ij = tl.max(qk)
+        m_i_new = tl.maximum(m_i, m_ij)
+        # alpha 把旧 acc/l_i 从旧 max 标尺 m_i 重新缩放到新 max 标尺 m_i_new。
+        alpha = tl.exp(m_i - m_i_new)
+        # p 是当前 tile 在新 max 标尺下的未归一化 softmax 权重。
+        p = tl.exp(qk - m_i_new)
+        acc = acc * alpha
+        l_i = l_i * alpha
+
+        # 第二遍扫描当前 tile 的 V：用当前 tile 的 softmax 权重累加 P*V。
+        # 这里和 FlashAttention v2 的思想一致：不 materialize 完整 attention matrix，
+        # 只保留当前 query 的 online softmax 累积状态。
+        for i in range(BLOCK_N):
+            token_idx = token_start + i
+            if token_idx < visible_len:
+                block_num = token_idx // block_size
+                block_offset = token_idx % block_size
+                block_table_offset = seq_idx * max_num_blocks + block_num
+                physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
+                if physical_block_idx != -1:
+                    v_offset = (
+                        physical_block_idx * block_size * num_kv_heads * head_dim
+                        + block_offset * num_kv_heads * head_dim
+                        + kv_head_idx * head_dim
+                        + offs_d
+                    )
+                    v_vec = tl.load(v_cache_ptr + v_offset)
+                    # 取出当前 token i 对应的权重 p[i]。p 是长度 BLOCK_N 的向量，
+                    # tl.where 生成 one-hot 后 sum，得到标量 weight。
+                    weight = tl.sum(tl.where(tl.arange(0, BLOCK_N) == i, p, 0.0))
+                    acc = acc + weight * v_vec
+                    l_i = l_i + weight
+
+        # 完成本 tile 后，提交新的 running max，并继续扫描下一个 KV tile。
+        m_i = m_i_new
+        token_start += BLOCK_N
+
+    # online softmax 的最终归一化：acc / l_i = softmax(QK) @ V。
+    out = acc / l_i
+    output_offset = q_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    tl.store(output_ptr + output_offset, out)
+
+
+# Python wrapper：只覆盖非量化 KV cache 的 chunked prefill。
+# FP8/KIVI 的 chunked prefill 需要在 kernel 内反量化，当前仍在 Attention.forward 中显式禁止。
+def paged_attention_prefill_triton(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    positions: torch.Tensor,
+    scale: float,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    block_size: int,
+) -> torch.Tensor:
+    query = query.contiguous()
+    output = torch.empty_like(query)
+    max_num_blocks = block_tables.shape[1]
+    num_seqs = context_lens.shape[0]
+    total_q = query.shape[0]
+    BLOCK_N = 64 if head_dim <= 128 else 32
+
+    grid = (total_q, num_heads, num_seqs)
+    paged_attention_prefill_kernel[grid](
+        output,
+        query,
+        k_cache,
+        v_cache,
+        block_tables,
+        context_lens,
+        cu_seqlens_q,
+        positions,
+        scale=scale,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        max_num_blocks=max_num_blocks,
+        BLOCK_N=BLOCK_N,
+    )
+    return output
+
+
+
 def paged_attention_decode(
     query: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1287,27 +1482,29 @@ class Attention(nn.Module):
         scale = self.scale / (self.head_dim ** 0.5)
 
         if context.is_prefill:
-            # Prefill: use flash attention
-            # Varlen mode: (total_tokens, num_heads, head_dim)
+            # is_prefill 只是 batch 级标记：表示本轮需要 eager prefill/mixed 路径，不能说明所有 seq 都是 full prefill。
+            # 只有 prepare_prefill/prepare_mixed 明确标记所有 seq 都是 pure full prefill 时，才走连续 q/k/v 的 flash prefill。
+            # 只要 batch 中存在 chunked prefill、extend 或 mixed decode，就必须走 paged prefill 从 KV cache 读取历史。
             cu_seqlens = context.cu_seqlens_q
             if cu_seqlens is None:
                 raise ValueError("cu_seqlens_q must be provided for varlen attention")
-            if context.positions is not None and context.positions.numel() > 0:
-                first_pos = int(context.positions[0].item())
-                if first_pos != 0:
-                    if fp8_enabled or kivi_enabled:
-                        raise NotImplementedError(
-                            "chunked prefill for quantized KV cache needs a "
-                            "dequantizing paged prefill/extend attention path"
-                        )
-                    o = paged_attention_prefill_torch(
-                        q, k_cache, v_cache,
-                        context.block_tables, context.context_lens,
-                        cu_seqlens, context.positions,
-                        scale, self.num_heads, self.num_kv_heads,
-                        self.block_size,
+            if not context.is_full_prefill:
+                # 量化 KV 的 chunked prefill 需要在 paged prefill kernel 内做反量化，当前只实现非量化路径。
+                if fp8_enabled or kivi_enabled:
+                    raise NotImplementedError(
+                        "chunked prefill for quantized KV cache needs a "
+                        "dequantizing paged prefill/extend attention path"
                     )
-                    return o.reshape(o.shape[0], self.num_heads * self.head_dim)
+                if context.positions is None or context.context_lens is None or context.block_tables is None:
+                    raise ValueError("paged prefill requires positions, context_lens, and block_tables")
+                o = paged_attention_prefill_triton(
+                    q, k_cache, v_cache,
+                    context.block_tables, context.context_lens,
+                    cu_seqlens, context.positions,
+                    scale, self.num_heads, self.num_kv_heads,
+                    self.head_dim, self.block_size,
+                )
+                return o.reshape(o.shape[0], self.num_heads * self.head_dim)
             
             o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
                                         self.num_heads, self.num_kv_heads, self.head_dim)

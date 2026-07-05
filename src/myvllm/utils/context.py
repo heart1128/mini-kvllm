@@ -13,6 +13,9 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     positions: torch.Tensor | None = None
+    # True 表示本轮 batch 中所有 seq 都是从 position 0 开始、q_len 覆盖完整 context 的 pure full prefill。
+    # mixed/chunked/decode-extend batch 即使 is_prefill=True，也必须保持 False，attention 才会走 paged prefill/extend。
+    is_full_prefill: bool = False
     # KIVI 量化路径需要用到的额外字段：
     # - residual_slots: (num_tokens,) 每个 token 在 fp16 residual 缓冲中的行号
     #   prefill 时 token 顺序展开；decode 时每个序列一个 slot
@@ -32,8 +35,8 @@ def reset_context():
 
 def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0,
                 slot_mapping=None, context_lens=None, block_tables=None, positions=None,
-                residual_slots=None, residual_lens=None):
+                is_full_prefill=False, residual_slots=None, residual_lens=None):
     global _context
     _context = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                        slot_mapping, context_lens, block_tables, positions,
-                       residual_slots, residual_lens)
+                       is_full_prefill, residual_slots, residual_lens)

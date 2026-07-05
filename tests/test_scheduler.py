@@ -15,6 +15,9 @@ def make_scheduler(
     max_cached_blocks=100,
     block_size=4,
     enable_chunked_prefill=True,
+    long_prefill_token_threshold=0,
+    max_num_partial_prefills=None,
+    max_long_partial_prefills=None,
 ):
     return Scheduler(
         max_num_sequences=max_num_sequences,
@@ -23,6 +26,9 @@ def make_scheduler(
         block_size=block_size,
         eos=0,
         enable_chunked_prefill=enable_chunked_prefill,
+        long_prefill_token_threshold=long_prefill_token_threshold,
+        max_num_partial_prefills=max_num_partial_prefills,
+        max_long_partial_prefills=max_long_partial_prefills,
     )
 
 
@@ -256,6 +262,136 @@ class TestChunkedPrefillMixedScheduling:
         assert scheduled == [ScheduledSequence(waiting, 3)]
         assert running not in [item.seq for item in scheduled]
         scheduler.block_manager.append.assert_not_called()
+
+
+class TestChunkedPrefillPolicy:
+    def test_long_prefill_threshold_limits_running_chunk_size(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=10,
+            long_prefill_token_threshold=3,
+        )
+        seq = Sequence(list(range(20)))
+        seq.status = SequenceStatus.RUNNING
+        seq.num_computed_tokens = 4
+        scheduler.running.append(seq)
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert scheduled == [ScheduledSequence(seq, 3)]
+
+    def test_long_prefill_threshold_limits_waiting_admission_chunk_size(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=10,
+            long_prefill_token_threshold=4,
+        )
+        seq = Sequence(list(range(20)))
+        scheduler.add_sequence(seq)
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_allocate.return_value = True
+        scheduler.block_manager.allocate.return_value = None
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert scheduled == [ScheduledSequence(seq, 4)]
+        assert seq in scheduler.running
+
+    def test_max_num_partial_prefills_blocks_new_partial_admission(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=8,
+            long_prefill_token_threshold=4,
+            max_num_partial_prefills=1,
+        )
+        running_partial = Sequence(list(range(20)))
+        running_partial.status = SequenceStatus.RUNNING
+        running_partial.num_computed_tokens = 4
+        scheduler.running.append(running_partial)
+        waiting = Sequence(list(range(20, 40)))
+        scheduler.add_sequence(waiting)
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_allocate.return_value = True
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert scheduled == [ScheduledSequence(running_partial, 4)]
+        assert waiting in scheduler.waiting
+        assert waiting not in scheduler.running
+        scheduler.block_manager.allocate.assert_not_called()
+
+    def test_max_long_partial_prefills_blocks_new_long_partial_admission_only(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=16,
+            long_prefill_token_threshold=4,
+            max_long_partial_prefills=1,
+        )
+        running_long_partial = Sequence(list(range(20)))
+        running_long_partial.status = SequenceStatus.RUNNING
+        running_long_partial.num_computed_tokens = 4
+        scheduler.running.append(running_long_partial)
+        waiting_long = Sequence(list(range(100, 120)))
+        scheduler.add_sequence(waiting_long)
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_allocate.return_value = True
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert scheduled == [ScheduledSequence(running_long_partial, 4)]
+        assert waiting_long in scheduler.waiting
+        assert waiting_long not in scheduler.running
+        scheduler.block_manager.allocate.assert_not_called()
+
+    def test_max_long_partial_prefills_allows_short_full_prefill_admission(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=16,
+            long_prefill_token_threshold=4,
+            max_long_partial_prefills=1,
+        )
+        running_long_partial = Sequence(list(range(20)))
+        running_long_partial.status = SequenceStatus.RUNNING
+        running_long_partial.num_computed_tokens = 4
+        scheduler.running.append(running_long_partial)
+        waiting_short = Sequence([100, 101, 102])
+        scheduler.add_sequence(waiting_short)
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_allocate.return_value = True
+        scheduler.block_manager.allocate.return_value = None
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert scheduled == [
+            ScheduledSequence(running_long_partial, 4),
+            ScheduledSequence(waiting_short, 3),
+        ]
+        assert waiting_short in scheduler.running
+
+    def test_running_order_matches_vllm_without_forcing_decode_first(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=5,
+            long_prefill_token_threshold=4,
+        )
+        prefill = Sequence(list(range(20)))
+        prefill.status = SequenceStatus.RUNNING
+        prefill.num_computed_tokens = 4
+        decode = Sequence([101, 102, 103])
+        inject_running(scheduler, decode)
+        scheduler.running = deque([prefill, decode])
+
+        scheduler.block_manager = MagicMock()
+        scheduler.block_manager.can_append.return_value = True
+        scheduler.block_manager.append.return_value = None
+
+        scheduled, is_prefill = scheduler.schedule()
+
+        assert is_prefill
+        assert scheduled == [ScheduledSequence(prefill, 4), ScheduledSequence(decode, 1)]
 
 
 class TestSchedulerHappyPath:

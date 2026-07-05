@@ -52,6 +52,9 @@ class LLMEngine:
             block_size=config.get("block_size", 256),
             eos=config.get("eos", 50256),
             enable_chunked_prefill=config.get("enable_chunked_prefill", True),
+            long_prefill_token_threshold=config.get("long_prefill_token_threshold", 0),
+            max_num_partial_prefills=config.get("max_num_partial_prefills"),
+            max_long_partial_prefills=config.get("max_long_partial_prefills"),
         )
 
         atexit.register(self.exit)
