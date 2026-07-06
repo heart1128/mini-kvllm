@@ -246,7 +246,12 @@ def run_engine_steps(
                     "elapsed_s": elapsed,
                     "step_time_s": step_time,
                     "num_processed_tokens": num_processed_tokens,
+                    "tokens_per_s": num_processed_tokens / step_time if step_time > 0 else float("nan"),
+                    "budget_utilization": num_processed_tokens / config["max_num_batched_tokens"],
                     "is_prefill": is_prefill,
+                    "waiting": len(engine.scheduler.waiting),
+                    "running": len(engine.scheduler.running),
+                    "outputs": len(outputs),
                 }
             )
 
@@ -296,6 +301,14 @@ def percentile(values: list[float], pct: float) -> float:
     return ordered[index]
 
 
+def mean_or_nan(values: list[float]) -> float:
+    return statistics.mean(values) if values else float("nan")
+
+
+def sum_or_nan(values: list[float]) -> float:
+    return sum(values) if values else float("nan")
+
+
 def summarize_result(
     scenario: str,
     enabled: bool,
@@ -315,8 +328,16 @@ def summarize_result(
         if name.startswith("long") and req["ttft_s"] is not None
     ]
     steps = result.get("steps", [])
-    prefill_steps = sum(1 for step in steps if step.get("is_prefill"))
-    decode_steps = sum(1 for step in steps if not step.get("is_prefill"))
+    prefill_step_records = [step for step in steps if step.get("is_prefill")]
+    decode_step_records = [step for step in steps if not step.get("is_prefill")]
+    prefill_steps = len(prefill_step_records)
+    decode_steps = len(decode_step_records)
+    prefill_step_times_ms = [step["step_time_s"] * 1000 for step in prefill_step_records]
+    decode_step_times_ms = [step["step_time_s"] * 1000 for step in decode_step_records]
+    processed_tokens = [step.get("num_processed_tokens", 0) for step in steps]
+    prefill_processed_tokens = [step.get("num_processed_tokens", 0) for step in prefill_step_records]
+    decode_processed_tokens = [step.get("num_processed_tokens", 0) for step in decode_step_records]
+    budget_utilizations = [step.get("budget_utilization", float("nan")) for step in steps]
     long_prompt_tokens = sum(
         tokens for name, tokens in prompt_tokens_by_name.items() if name.startswith("long")
     )
@@ -341,6 +362,23 @@ def summarize_result(
         "prompt_tokens": sum(prompt_tokens_by_name.values()),
         "long_prompt_tokens": long_prompt_tokens,
         "short_prompt_tokens": short_prompt_tokens,
+        "prefill_step_ms": mean_or_nan(prefill_step_times_ms),
+        "prefill_p90_step_ms": percentile(prefill_step_times_ms, 0.9),
+        "decode_step_ms": mean_or_nan(decode_step_times_ms),
+        "decode_p90_step_ms": percentile(decode_step_times_ms, 0.9),
+        "processed_tokens_per_s": (
+            sum_or_nan(processed_tokens) / result["total_latency_s"]
+            if processed_tokens and result["total_latency_s"] > 0 else float("nan")
+        ),
+        "prefill_processed_tokens_per_s": (
+            sum_or_nan(prefill_processed_tokens) / sum(step["step_time_s"] for step in prefill_step_records)
+            if prefill_step_records and sum(step["step_time_s"] for step in prefill_step_records) > 0 else float("nan")
+        ),
+        "decode_processed_tokens_per_s": (
+            sum_or_nan(decode_processed_tokens) / sum(step["step_time_s"] for step in decode_step_records)
+            if decode_step_records and sum(step["step_time_s"] for step in decode_step_records) > 0 else float("nan")
+        ),
+        "avg_budget_utilization": mean_or_nan(budget_utilizations),
     }
 
 
@@ -358,6 +396,10 @@ def print_table(rows: list[dict[str, Any]]) -> None:
         "decode tok/s",
         "prefill steps",
         "decode steps",
+        "prefill step(ms)",
+        "decode step(ms)",
+        "proc tok/s",
+        "budget util",
         "prompt toks",
         "long toks",
         "short toks",
@@ -381,6 +423,10 @@ def print_table(rows: list[dict[str, Any]]) -> None:
                     "skipped" if row.get("skipped") else f"{row['decode_tps']:.2f}",
                     "skipped" if row.get("skipped") else str(row["prefill_steps"]),
                     "skipped" if row.get("skipped") else str(row["decode_steps"]),
+                    "skipped" if row.get("skipped") else f"{row['prefill_step_ms']:.2f}",
+                    "skipped" if row.get("skipped") else f"{row['decode_step_ms']:.2f}",
+                    "skipped" if row.get("skipped") else f"{row['processed_tokens_per_s']:.2f}",
+                    "skipped" if row.get("skipped") else f"{row['avg_budget_utilization']:.2f}",
                     "skipped" if row.get("skipped") else str(row["prompt_tokens"]),
                     "skipped" if row.get("skipped") else str(row["long_prompt_tokens"]),
                     "skipped" if row.get("skipped") else str(row["short_prompt_tokens"]),
