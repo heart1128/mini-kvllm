@@ -197,6 +197,7 @@ class Scheduler:
             seq = self.waiting.popleft()
             self.block_manager.allocate(seq)
             # prefix cache 命中的 token 已经有可复用 KV，不需要重复 forward。
+            # allocate() 可能更新 num_cached_tokens，所以必须在这里之后再计算 chunk 大小。
             seq.num_computed_tokens = max(seq.num_computed_tokens, seq.num_cached_tokens)
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
@@ -234,11 +235,17 @@ class Scheduler:
             ):
                 seq = self.waiting.popleft()
                 self.block_manager.allocate(seq)
+                # allocate() may update seq.num_cached_tokens when prefix cache hits.
+                # Recompute the actual number of tokens to forward after allocation;
+                # otherwise identical long prompts can be scheduled with the stale
+                # full prompt length and prepare_mixed() will write past block_table.
                 seq.num_computed_tokens = max(seq.num_computed_tokens, seq.num_cached_tokens)
+                num_new_tokens = seq.num_prompt_tokens - seq.num_computed_tokens
                 seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)
-                scheduled_sequences.append(ScheduledSequence(seq, num_new_tokens))
-                current_scheduled_tokens += num_new_tokens
+                if num_new_tokens > 0:
+                    scheduled_sequences.append(ScheduledSequence(seq, num_new_tokens))
+                    current_scheduled_tokens += num_new_tokens
             else:
                 break
         if scheduled_sequences:

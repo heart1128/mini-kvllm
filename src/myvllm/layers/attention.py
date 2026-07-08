@@ -108,9 +108,11 @@ def store_kvcache(
     )
 
 
-# ===================== FP8 KV Cache 量化相关 =====================
-# FP8 e4m3fn 的最大可表示绝对值，用于计算量化 scale (amax / FP8_E4M3_MAX)
+# ===================== KV Cache 量化相关 =====================
+# FP8 e4m3fn 与 INT8 的量化范围，用于计算 scale (amax / quant_max)
 FP8_E4M3_MAX = 448.0
+INT8_MAX = 127.0
+INT8_MIN = -128.0
 
 
 @triton.jit
@@ -189,6 +191,93 @@ def store_kvcache_fp8_kernel(
     tl.store(v_cache_ptr + cache_offset, v_q.to(v_cache_ptr.dtype.element_ty))
 
 
+@triton.jit
+def store_kvcache_int8_kernel(
+    key_ptr,
+    value_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    slot_mapping_ptr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    INT8_QMAX: tl.constexpr,
+    INT8_QMIN: tl.constexpr,
+):
+    """将 key/value 按 per-token-head 动态 scale 量化为 INT8 并写入 paged cache。"""
+    token_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx == -1:
+        return
+
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+
+    head_offsets = tl.arange(0, head_dim)
+    input_offset = (token_idx * num_kv_heads * head_dim +
+                    head_idx * head_dim +
+                    head_offsets)
+    cache_offset = (block_idx * block_size * num_kv_heads * head_dim +
+                    block_offset * num_kv_heads * head_dim +
+                    head_idx * head_dim +
+                    head_offsets)
+
+    key = tl.load(key_ptr + input_offset).to(tl.float32)
+    value = tl.load(value_ptr + input_offset).to(tl.float32)
+
+    k_amax = tl.max(tl.abs(key))
+    v_amax = tl.max(tl.abs(value))
+    k_scale = tl.maximum(k_amax / INT8_QMAX, 1e-6)
+    v_scale = tl.maximum(v_amax / INT8_QMAX, 1e-6)
+
+    scale_offset = (block_idx * block_size * num_kv_heads +
+                    block_offset * num_kv_heads +
+                    head_idx)
+    tl.store(k_scale_ptr + scale_offset, k_scale)
+    tl.store(v_scale_ptr + scale_offset, v_scale)
+
+    k_q = key * (1.0 / k_scale)
+    v_q = value * (1.0 / v_scale)
+    # Triton 写 int8 时会截断；先做 half-away-from-zero rounding 对齐 vLLM。
+    k_q = tl.where(k_q >= 0, k_q + 0.5, k_q - 0.5)
+    v_q = tl.where(v_q >= 0, v_q + 0.5, v_q - 0.5)
+    k_q = tl.clamp(k_q, INT8_QMIN, INT8_QMAX)
+    v_q = tl.clamp(v_q, INT8_QMIN, INT8_QMAX)
+
+    tl.store(k_cache_ptr + cache_offset, k_q.to(k_cache_ptr.dtype.element_ty))
+    tl.store(v_cache_ptr + cache_offset, v_q.to(v_cache_ptr.dtype.element_ty))
+
+
+def store_kvcache_int8(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_size: int,
+):
+    """将 key/value 按 per-token-head 动态 scale 量化为 INT8 写入 paged cache。"""
+    num_tokens, num_kv_heads, head_dim = key.shape
+    key = key.contiguous()
+    value = value.contiguous()
+
+    grid = (num_tokens, num_kv_heads)
+    store_kvcache_int8_kernel[grid](
+        key, value, k_cache, v_cache, k_scale, v_scale, slot_mapping,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        INT8_QMAX=INT8_MAX,
+        INT8_QMIN=INT8_MIN,
+    )
+
+
 def store_kvcache_fp8(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -260,41 +349,50 @@ def flash_attention_varlen_kernel(
     Each program processes one block of queries for one head in one sequence.
     """
     # Program IDs
-    start_m = tl.program_id(0) # block index
-    off_h = tl.program_id(1) # head index
-    seq_idx = tl.program_id(2) # sequence index
+    start_m = tl.program_id(0) # block index 这个是这批中最大序列长度 / BLOCK_M的块大小，也就是处理一个block_M的token数量
+    off_h = tl.program_id(1) # head index  这个是处理的第几个头（因为一个block_M是处理一个头的）
+    seq_idx = tl.program_id(2) # sequence index 这个是处理的第几个序列
 
     # Determine which KV head to use (for GQA)
+    # GQA一个Q对应K/V头，所以需要通过off_h // (num_heads // num_kv_heads)来确定使用哪个K/V头
     kv_head_idx = off_h // (num_heads // num_kv_heads)
     
     # Load sequence boundaries
+    # 当前program的token的数量
     seq_start = tl.load(cu_seqlens_q_ptr + seq_idx)
     seq_end = tl.load(cu_seqlens_q_ptr + seq_idx + 1)
     seq_len = seq_end - seq_start
     
     # Early exit if this block is beyond sequence length
+    # 边界，这个block_M超出了序列的长度，就直接返回，不处理了。
+    # 因为start_m是按照最大的序列长度来分配的。小的序列超过自己的长度就跳出了
     if start_m * BLOCK_M >= seq_len:
         return
     
     # Offset for this block of queries
+    # 找到第几个block，offs_m是这个block里面所有的token idx
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    # 这是head的idx，每个token的head数量都是固定的，所以这个offs_d也是固定的。
     offs_d = tl.arange(0, head_dim)
     
     # Query pointers: Q has shape (total_tokens, num_heads, head_dim)
+    # Q的第一维是全部token的q拼接的，取从当前序列开始第几个token的q，要跳过前面其他序列的q。
+    # 所以需要加上seq_start，找到从当前序列开始的q。off_h是处理的第几个头，offs_d是处理的这个头的第几个token。
     q_ptrs = Q + (seq_start + offs_m[:, None]) * num_heads * head_dim + off_h * head_dim + offs_d[None, :]
     
     # Load Q block - shape (BLOCK_M, head_dim)
-    mask_m = offs_m < seq_len
+    mask_m = offs_m < seq_len # 不能超过当前序列的长度，否则会访问越界
     q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
     
     # Initialize output accumulators
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10
-    acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) # 到目前为止，每个 query token 的 softmax 分母
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - 1e10 # 到目前为止，每个 query token 的最大值
+    acc = tl.zeros([BLOCK_M, head_dim], dtype=tl.float32) # 到目前为止，每个 query token 的 weighted value累和
     
     # Number of blocks to process
     num_blocks = tl.cdiv(seq_len, BLOCK_N)
     
+    # Q是外循环，KV分块进行内循环计算。这样Q-KV的计算可以并行化。
     # Loop over K, V blocks
     for block_n in range(num_blocks):
         start_n = block_n * BLOCK_N
@@ -318,10 +416,10 @@ def flash_attention_varlen_kernel(
         qk = tl.where(mask_causal & mask_n[None, :], qk, -1e10)
         
         # Online softmax update
-        m_ij = tl.max(qk, axis=1)
-        m_i_new = tl.maximum(m_i, m_ij)
-        alpha = tl.exp(m_i - m_i_new)
-        p = tl.exp(qk - m_i_new[:, None])
+        m_ij = tl.max(qk, axis=1) # 当前 K block 内，每个 query 的最大 score
+        m_i_new = tl.maximum(m_i, m_ij) # 历史最大 score 和当前 block 最大 score 的合并
+        alpha = tl.exp(m_i - m_i_new) # 分母：历史最大 score 和当前 block 最大 score 的差值的指数
+        p = tl.exp(qk - m_i_new[:, None]) # 分子：当前 score - 当前 block 最大 score，然后指数化
         
         # Rescale previous accumulator
         acc = acc * alpha[:, None]
@@ -1023,7 +1121,96 @@ def paged_attention_decode_fp8_kernel(
     tl.store(output_ptr + output_offset, output.to(output_ptr.dtype.element_ty))
 
 
-def paged_attention_decode_fp8(
+@triton.jit
+def paged_attention_decode_quantized_tile_kernel(
+    output_ptr,
+    query_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    block_tables_ptr,
+    context_lens_ptr,
+    scale: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_num_blocks: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Tile 化 per-token-head 量化 decode，减少逐 token 标量循环。"""
+    batch_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+    kv_head_idx = head_idx // (num_heads // num_kv_heads)
+
+    context_len = tl.load(context_lens_ptr + batch_idx)
+    offs_d = tl.arange(0, head_dim)
+    offs_n_base = tl.arange(0, BLOCK_N)
+
+    q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    q = tl.load(query_ptr + q_offset).to(tl.float32)
+
+    acc = tl.zeros([head_dim], dtype=tl.float32)
+    l_i = 0.0
+    m_i = -1e10
+
+    max_chunks = tl.cdiv(max_num_blocks * block_size, BLOCK_N)
+    for chunk_idx in range(max_chunks):
+        token_start = chunk_idx * BLOCK_N
+        if token_start < context_len:
+            token_idxs = token_start + offs_n_base
+            valid_tokens = token_idxs < context_len
+            block_nums = token_idxs // block_size
+            block_offsets = token_idxs % block_size
+
+            block_table_offsets = batch_idx * max_num_blocks + block_nums
+            physical_blocks = tl.load(
+                block_tables_ptr + block_table_offsets,
+                mask=block_nums < max_num_blocks,
+                other=-1,
+            )
+            valid_cache = valid_tokens & (physical_blocks != -1)
+
+            cache_base = (physical_blocks * block_size * num_kv_heads * head_dim +
+                          block_offsets * num_kv_heads * head_dim +
+                          kv_head_idx * head_dim)
+            scale_offsets = (physical_blocks * block_size * num_kv_heads +
+                             block_offsets * num_kv_heads + kv_head_idx)
+
+            K_TILE = tl.load(
+                k_cache_ptr + cache_base[:, None] + offs_d[None, :],
+                mask=valid_cache[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            k_scales = tl.load(k_scale_ptr + scale_offsets, mask=valid_cache, other=0.0)
+            qk = tl.sum(K_TILE * q[None, :], axis=1) * k_scales * scale
+            qk = tl.where(valid_tokens, qk, -1e10)
+
+            m_ij = tl.max(qk)
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new)
+            p = tl.where(valid_tokens, p, 0.0)
+
+            V_TILE = tl.load(
+                v_cache_ptr + cache_base[:, None] + offs_d[None, :],
+                mask=valid_cache[:, None],
+                other=0.0,
+            ).to(tl.float32)
+            v_scales = tl.load(v_scale_ptr + scale_offsets, mask=valid_cache, other=0.0)
+            weights = p * v_scales
+
+            acc = acc * alpha + tl.sum(V_TILE * weights[:, None], axis=0)
+            l_i = l_i * alpha + tl.sum(p)
+            m_i = m_i_new
+
+    output = acc / l_i
+    output_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
+    tl.store(output_ptr + output_offset, output.to(output_ptr.dtype.element_ty))
+
+
+def paged_attention_decode_quantized(
     query: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -1039,7 +1226,8 @@ def paged_attention_decode_fp8(
     kv_cache_dtype: str,
 ) -> torch.Tensor:
     """
-    decode 阶段基于 FP8 paged cache 计算注意力 (含反量化) 的 Python 封装。
+    decode 阶段基于量化 paged cache 计算注意力 (含反量化) 的 Python 封装。
+    支持 fp8_per_tensor、fp8_per_token_head、int8_per_token_head。
     输出 dtype 与 query 一致 (fp16/bf16)。
     """
     batch_size = query.shape[0]
@@ -1048,21 +1236,35 @@ def paged_attention_decode_fp8(
     output = torch.empty_like(query)
 
     BLOCK_N = 64 if head_dim <= 128 else 32
-    per_token_head = 1 if kv_cache_dtype == 'fp8_per_token_head' else 0
+    per_token_head = 1 if kv_cache_dtype in ('fp8_per_token_head', 'int8_per_token_head') else 0
     grid = (batch_size, num_heads)
 
-    paged_attention_decode_fp8_kernel[grid](
-        output, query, k_cache, v_cache, k_scale, v_scale,
-        block_tables, context_lens,
-        scale=scale,
-        num_heads=num_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        block_size=block_size,
-        max_num_blocks=max_num_blocks,
-        BLOCK_N=BLOCK_N,
-        PER_TOKEN_HEAD=per_token_head,
-    )
+    if kv_cache_dtype in ('fp8_per_token_head', 'int8_per_token_head') and head_dim <= 128:
+        paged_attention_decode_quantized_tile_kernel[grid](
+            output, query, k_cache, v_cache, k_scale, v_scale,
+            block_tables, context_lens,
+            scale=scale,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            max_num_blocks=max_num_blocks,
+            BLOCK_N=BLOCK_N,
+            num_warps=4,
+        )
+    else:
+        paged_attention_decode_fp8_kernel[grid](
+            output, query, k_cache, v_cache, k_scale, v_scale,
+            block_tables, context_lens,
+            scale=scale,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+            max_num_blocks=max_num_blocks,
+            BLOCK_N=BLOCK_N,
+            PER_TOKEN_HEAD=per_token_head,
+        )
     return output
 
 
@@ -1429,7 +1631,7 @@ class Attention(nn.Module):
         self.block_size = block_size
         self.k_cache = self.v_cache = torch.tensor([])
         # KV cache 量化相关属性，默认不量化；由 ModelRunner.allocate_kv_cache 注入实际值
-        self.kv_cache_dtype = 'auto'   # "auto" | "fp8_per_tensor" | "fp8_per_token_head" | "kivi_2bit" | "kivi_4bit"
+        self.kv_cache_dtype = 'auto'   # "auto" | "fp8_per_tensor" | "fp8_per_token_head" | "int8_per_token_head" | "kivi_2bit" | "kivi_4bit"
         self.k_scale = None            # FP8/KIVI 量化时的 K scale 张量
         self.v_scale = None            # FP8/KIVI 量化时的 V scale 张量
         # KIVI 专用
@@ -1443,9 +1645,11 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        # 路径选择: auto / fp8_* / kivi_*
+        # 路径选择: auto / fp8_* / int8_per_token_head / kivi_*
         kivi_enabled = isinstance(self.kv_cache_dtype, str) and self.kv_cache_dtype.startswith('kivi')
-        fp8_enabled = (self.kv_cache_dtype != 'auto') and not kivi_enabled
+        fp8_enabled = self.kv_cache_dtype in ('fp8_per_tensor', 'fp8_per_token_head')
+        int8_enabled = self.kv_cache_dtype == 'int8_per_token_head'
+        kv_quant_enabled = fp8_enabled or int8_enabled
 
         # Store current k, v into cache if cache is allocated
         if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
@@ -1469,6 +1673,13 @@ class Attention(nn.Module):
                     context.slot_mapping, context.residual_slots, context.residual_lens,
                     self.block_size, self.kivi_group_size, self.kivi_residual_length, self.kivi_bits,
                 )
+            elif int8_enabled:
+                # INT8 per-token-head 量化写入：动态 scale + round + clamp
+                store_kvcache_int8(
+                    k_to_store, v_to_store, k_cache, v_cache,
+                    self.k_scale, self.v_scale,
+                    context.slot_mapping, self.block_size,
+                )
             elif fp8_enabled:
                 # FP8 量化写入：量化 + 写 scale
                 store_kvcache_fp8(
@@ -1490,13 +1701,64 @@ class Attention(nn.Module):
                 raise ValueError("cu_seqlens_q must be provided for varlen attention")
             if not context.is_full_prefill:
                 # 量化 KV 的 chunked prefill 需要在 paged prefill kernel 内做反量化，当前只实现非量化路径。
-                if fp8_enabled or kivi_enabled:
+                if kv_quant_enabled or kivi_enabled:
                     raise NotImplementedError(
                         "chunked prefill for quantized KV cache needs a "
                         "dequantizing paged prefill/extend attention path"
                     )
                 if context.positions is None or context.context_lens is None or context.block_tables is None:
                     raise ValueError("paged prefill requires positions, context_lens, and block_tables")
+                split = context.mixed_attention_split
+                if split is not None:
+                    if split.decode_token_indices and split.prefill_token_indices:
+                        # 对齐 vLLM 的思路：scheduler 仍然可以给出 mixed batch，
+                        # attention backend 根据 metadata 把 decode 与 prefill/extend 分开执行。
+                        # MiniVLLM 不重排 scheduler 输出；这里只临时 index_select，最后 scatter 回原 token 顺序。
+                        if (
+                            split.decode_token_indices_tensor is None
+                            or split.decode_seq_indices_tensor is None
+                            or split.prefill_token_indices_tensor is None
+                            or split.prefill_seq_indices_tensor is None
+                            or split.prefill_cu_seqlens_q_tensor is None
+                        ):
+                            raise ValueError("mixed attention split tensors must be prepared")
+                        o = torch.empty_like(q)
+                        decode_token_indices = split.decode_token_indices_tensor
+                        decode_seq_indices = split.decode_seq_indices_tensor
+                        decode_out = paged_attention_decode(
+                            q.index_select(0, decode_token_indices),
+                            k_cache,
+                            v_cache,
+                            context.block_tables.index_select(0, decode_seq_indices),
+                            context.context_lens.index_select(0, decode_seq_indices),
+                            scale,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            self.block_size,
+                        )
+                        o.index_copy_(0, decode_token_indices, decode_out)
+
+                        prefill_token_indices = split.prefill_token_indices_tensor
+                        prefill_seq_indices = split.prefill_seq_indices_tensor
+                        prefill_cu_seqlens_q = split.prefill_cu_seqlens_q_tensor
+                        prefill_out = paged_attention_prefill_triton(
+                            q.index_select(0, prefill_token_indices),
+                            k_cache,
+                            v_cache,
+                            context.block_tables.index_select(0, prefill_seq_indices),
+                            context.context_lens.index_select(0, prefill_seq_indices),
+                            prefill_cu_seqlens_q,
+                            context.positions.index_select(0, prefill_token_indices),
+                            scale,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            self.block_size,
+                        )
+                        o.index_copy_(0, prefill_token_indices, prefill_out)
+                        return o.reshape(o.shape[0], self.num_heads * self.head_dim)
+
                 o = paged_attention_prefill_triton(
                     q, k_cache, v_cache,
                     context.block_tables, context.context_lens,
@@ -1520,9 +1782,9 @@ class Attention(nn.Module):
                     scale, self.num_heads, self.num_kv_heads, self.head_dim,
                     self.block_size, self.kivi_group_size,
                 )
-            elif fp8_enabled:
-                # decode 阶段从 FP8 cache 读取并反量化
-                o = paged_attention_decode_fp8(
+            elif kv_quant_enabled:
+                # decode 阶段从量化 cache 读取并反量化
+                o = paged_attention_decode_quantized(
                     q, k_cache, v_cache, self.k_scale, self.v_scale,
                     context.block_tables, context.context_lens,
                     scale, self.num_heads, self.num_kv_heads, self.head_dim,

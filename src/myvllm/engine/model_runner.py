@@ -12,6 +12,7 @@ from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
 from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.utils import *
+from myvllm.utils.context import split_mixed_decode_prefill_metadata
 
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
@@ -214,17 +215,19 @@ class ModelRunner:
         num_kv_heads = self.config['num_kv_heads'] // self.world_size
         head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
 
-        # ============ KV Cache FP8 量化配置解析 ============
+        # ============ KV Cache 量化配置解析 ============
         # kv_cache_dtype 决定 KV cache 的存储精度与量化模式：
         #   "auto"               -> 不量化，使用默认精度 (fp16/bf16)
         #   "fp8_per_tensor"     -> FP8 量化，整个 cache 共享一组 (K/V 各一个) 标量 scale
         #   "fp8_per_token_head" -> FP8 量化，每个 (token, kv_head) 组合独立一个 scale (对齐 vLLM)
+        #   "int8_per_token_head"-> INT8 量化，每个 (token, kv_head) 组合独立一个 scale (对齐 vLLM)
         #   "kivi_2bit"          -> KIVI 2-bit 量化 (K per-channel-per-block / V per-token-per-head + fp16 residual)
         #   "kivi_4bit"          -> KIVI 4-bit 量化 (同上, bit-width 不同)
         # 参考 vLLM 的 KVQuantMode，per_token_head 精度更高、对离群值更鲁棒。
         self.kv_cache_dtype = self.config.get('kv_cache_dtype', 'auto')
-        # 是否启用 fp8 量化
-        self.kv_quant_enabled = self.kv_cache_dtype != 'auto'
+        is_per_token_head_quant = self.kv_cache_dtype in ('fp8_per_token_head', 'int8_per_token_head')
+        # 是否启用普通 KV cache 量化 (不含 KIVI)
+        self.kv_quant_enabled = self.kv_cache_dtype in ('fp8_per_tensor', 'fp8_per_token_head', 'int8_per_token_head')
         # 是否启用 KIVI 量化路径
         self.kivi_enabled = self.kv_cache_dtype.startswith('kivi')
         # KIVI 超参数 (仅 KIVI 路径生效)
@@ -235,6 +238,9 @@ class ModelRunner:
         if self.kivi_enabled:
             # KIVI: 量化值用 int8 容器装载 (2-bit/4-bit 占低 bit; 不在分配阶段做 bit-pack, kernel 内逐元素读取)
             # 这样 cache shape 与 fp16 完全一致，便于把 paged attention 的索引计算复用
+            kv_data_dtype = torch.int8
+        elif self.kv_cache_dtype == 'int8_per_token_head':
+            # INT8 per-token-head: 1 字节/元素，scale 与 fp8_per_token_head 同布局
             kv_data_dtype = torch.int8
         elif self.kv_quant_enabled:
             # FP8 e4m3fn: 1 字节/元素, 数值范围 [-448, 448]
@@ -251,7 +257,7 @@ class ModelRunner:
         block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * elem_bytes
         # per_token_head 模式额外需要为每个 (slot, kv_head) 存一个 float32 scale (K/V 各一份)
         # 额外开销 = block_size * 2(K和V) * num_layers * num_kv_heads * 4(float32)
-        if self.kv_cache_dtype == 'fp8_per_token_head':
+        if is_per_token_head_quant:
             block_bytes += self.block_size * 2 * num_layers * num_kv_heads * 4
         if self.kivi_enabled:
             # KIVI 每个 block 额外开销 (按 fp32=4 bytes 计算):
@@ -307,8 +313,8 @@ class ModelRunner:
             dtype=kv_data_dtype, device=f'cuda:{self.rank}'
         )
 
-        # ============ 为 FP8 量化分配 scale 张量 ============
-        # scale 始终用 float32 存储，反量化时: x_fp16 = x_fp8.to(float) * scale
+        # ============ 为 KV cache 量化分配 scale 张量 ============
+        # scale 始终用 float32 存储，反量化时: x_fp16 = x_quant.to(float) * scale
         allocated_k_scale = None
         allocated_v_scale = None
         # KIVI 量化使用的额外张量 (K 用非对称, 需 zero; V 用对称, scale 即可)
@@ -321,7 +327,7 @@ class ModelRunner:
             scale_buf = torch.ones(2, num_layers, 1, dtype=torch.float32, device=f'cuda:{self.rank}')
             allocated_k_scale = scale_buf[0]
             allocated_v_scale = scale_buf[1]
-        elif self.kv_cache_dtype == 'fp8_per_token_head':
+        elif is_per_token_head_quant:
             # per_token_head: 每个 (block, slot, kv_head) 一个 scale (对齐 vLLM 的 shape)
             # 形状: (2, num_layers, max_cached_blocks, block_size, num_kv_heads)
             scale_buf = torch.ones(
@@ -505,6 +511,8 @@ class ModelRunner:
         cu_seqlens_k = [0]
         block_tables = []
         is_full_prefill_items = []
+        query_lens = []
+        is_decode_items = []
         seqs = [item.seq for item in scheduled_items]
 
         for item in scheduled_items:
@@ -531,6 +539,8 @@ class ModelRunner:
             seqlens_q.append(item.num_scheduled_tokens)
             seqlens_k.append(end)
             context_lens.append(end)
+            query_lens.append(item.num_scheduled_tokens)
+            is_decode_items.append(seq.num_computed_tokens >= seq.num_prompt_tokens)
             cu_seqlens_q.append(cu_seqlens_q[-1] + item.num_scheduled_tokens)
             cu_seqlens_k.append(cu_seqlens_k[-1] + end)
 
@@ -545,6 +555,40 @@ class ModelRunner:
         max_num_blocks = max(len(seq.block_table) for seq in seqs)
         for seq in seqs:
             block_tables.append(seq.block_table + [-1] * (max_num_blocks - len(seq.block_table)))
+
+        mixed_attention_split = split_mixed_decode_prefill_metadata(
+            cu_seqlens_q, query_lens, is_decode_items
+        )
+        has_mixed_decode_prefill = (
+            bool(mixed_attention_split.decode_token_indices)
+            and bool(mixed_attention_split.prefill_token_indices)
+        )
+        if has_mixed_decode_prefill:
+            mixed_attention_split.decode_token_indices_tensor = torch.tensor(
+                mixed_attention_split.decode_token_indices,
+                dtype=torch.long,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            mixed_attention_split.decode_seq_indices_tensor = torch.tensor(
+                mixed_attention_split.decode_seq_indices,
+                dtype=torch.long,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            mixed_attention_split.prefill_token_indices_tensor = torch.tensor(
+                mixed_attention_split.prefill_token_indices,
+                dtype=torch.long,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            mixed_attention_split.prefill_seq_indices_tensor = torch.tensor(
+                mixed_attention_split.prefill_seq_indices,
+                dtype=torch.long,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+            mixed_attention_split.prefill_cu_seqlens_q_tensor = torch.tensor(
+                mixed_attention_split.prefill_cu_seqlens_q,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
 
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
@@ -573,6 +617,9 @@ class ModelRunner:
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             positions=torch.tensor(positions, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
+            query_lens=torch.tensor(query_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
+            is_decode=torch.tensor(is_decode_items, dtype=torch.bool, pin_memory=True).cuda(non_blocking=True),
+            mixed_attention_split=mixed_attention_split,
             is_full_prefill=all(is_full_prefill_items),
             residual_slots=residual_slots_tensor,
             residual_lens=residual_lens_tensor,
