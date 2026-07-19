@@ -7,7 +7,7 @@ KV Cache 量化 Benchmark
   1. Memory              显存容量：每 block KV 字节数、max_cached_blocks、容量提升
   2. Latency/Throughput  单请求延迟与 decode 吞吐：TTFT、TPOT、tokens/s
   3. Concurrency         多并发端到端吞吐：batch size 扩展收益
-  4. Accuracy            精度：相对 fp16 基线的 token 一致率
+  4. Accuracy            精度：相对 auto 基线的 token 一致率
 
 输出策略：终端报告 + JSON 原始结果 + PNG 图；不生成表格文件。
 
@@ -25,6 +25,7 @@ import argparse
 import gc
 import json
 import math
+import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -35,12 +36,14 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 
-QUANT_FORMAT = "FP8 E4M3FN (max=448) / INT8 (range=-128..127)"
+QUANT_FORMAT = "FP8 E4M3FN / INT8 / INT4 packed per-token-head and group-wise (optional RHT)"
 MODE_COLORS = {
     "auto": "#888888",
     "fp8_per_tensor": "#e88aac",
     "fp8_per_token_head": "#55aa88",
     "int8_per_token_head": "#5588cc",
+    "int4_per_token_head": "#cc8a33",
+    "int4_groupwise": "#9a6fbe",
 }
 
 
@@ -53,7 +56,11 @@ class BenchmarkConfig:
         "fp8_per_tensor",
         "fp8_per_token_head",
         "int8_per_token_head",
+        "int4_per_token_head",
+        "int4_groupwise",
     )
+    kv_group_size: int = 32
+    kv_use_rht: bool = False
     max_num_sequences: int = 8
     max_num_batched_tokens: int = 8192
     max_cached_blocks: int = 2048
@@ -71,6 +78,8 @@ class BenchmarkConfig:
     eos: int = 151645
     latency_prompt_len: int = 256
     latency_gen_tokens: int = 64
+    latency_repeats: int = 5
+    benchmark_seed: int = 20260709
     latency_max_model_length: int = 1024
     concurrency_batch_sizes: tuple[int, ...] = (1, 4, 8)
     concurrency_prompt_len: int = 128
@@ -174,6 +183,8 @@ def build_engine_config(config: BenchmarkConfig, kv_cache_dtype: str, max_model_
         "gpu_memory_utilization": config.gpu_memory_utilization,
         "eos": config.eos,
         "kv_cache_dtype": kv_cache_dtype,
+        "kv_group_size": config.kv_group_size,
+        "kv_use_rht": config.kv_use_rht,
     }
 
 
@@ -241,6 +252,7 @@ def empty_results(config: BenchmarkConfig) -> dict[str, Any]:
         "latency": {},
         "concurrency": {},
         "accuracy": {},
+        "roundtrip": {},
         "failures": [],
     }
 
@@ -253,10 +265,15 @@ def record_failure(results: dict[str, Any], suite: str, mode: str, error: Except
 
 def block_bytes_for_mode(config: BenchmarkConfig, mode: str) -> dict[str, float]:
     elem_bytes = 2 if mode == "auto" else 1
-    data_bytes = config.block_size * 2 * config.num_layers * config.num_kv_heads * config.head_dim * elem_bytes
+    is_int4 = mode in ("int4_per_token_head", "int4_groupwise")
+    head_dim = (config.head_dim + 1) // 2 if is_int4 else config.head_dim
+    data_bytes = config.block_size * 2 * config.num_layers * config.num_kv_heads * head_dim * elem_bytes
     scale_bytes = 0
-    if mode in ("fp8_per_token_head", "int8_per_token_head"):
+    if mode in ("fp8_per_token_head", "int8_per_token_head", "int4_per_token_head"):
         scale_bytes = config.block_size * 2 * config.num_layers * config.num_kv_heads * 4
+    elif mode == "int4_groupwise":
+        n_groups = config.head_dim // config.kv_group_size
+        scale_bytes = config.block_size * 2 * config.num_layers * config.num_kv_heads * n_groups * 4
     total_bytes = data_bytes + scale_bytes
     fp16_bytes = config.block_size * 2 * config.num_layers * config.num_kv_heads * config.head_dim * 2
     return {
@@ -339,10 +356,13 @@ def collect_kv_cache_diagnostics(engine: Any, block_size: int) -> dict[str, Any]
     v_scale_bytes = v_scale_numel * tensor_element_size(v_scale)
     kv_scale_bytes = kv_scale_numel * tensor_element_size(kv_scale)
 
+    num_blocks = k_shape[0] if k_shape else 0
     num_kv_heads = k_shape[2] if k_shape and len(k_shape) >= 4 else 0
     head_dim = k_shape[3] if k_shape and len(k_shape) >= 4 else 0
-    actual_block_bytes = block_size * num_kv_heads * head_dim * (k_elem_bytes + v_elem_bytes)
+    actual_data_block_bytes = block_size * num_kv_heads * head_dim * (k_elem_bytes + v_elem_bytes)
     scale_bytes = k_scale_bytes + v_scale_bytes + kv_scale_bytes
+    actual_scale_block_bytes = scale_bytes / num_blocks if num_blocks > 0 else 0
+    actual_block_bytes = actual_data_block_bytes + actual_scale_block_bytes
 
     return {
         "actual_k_cache_dtype": tensor_dtype_name(k_cache),
@@ -356,6 +376,9 @@ def collect_kv_cache_diagnostics(engine: Any, block_size: int) -> dict[str, Any]
         "actual_scale_shape": kv_scale_shape,
         "actual_scale_numel": k_scale_numel + v_scale_numel + kv_scale_numel,
         "actual_scale_bytes": scale_bytes,
+        "actual_data_block_bytes": actual_data_block_bytes,
+        "actual_scale_block_bytes": actual_scale_block_bytes,
+        "actual_block_bytes": actual_block_bytes,
         "actual_total_block_bytes": actual_block_bytes,
     }
 
@@ -387,6 +410,25 @@ def run_memory_benchmark(config: BenchmarkConfig, results: dict[str, Any]) -> No
         results["memory"][mode] = stats
 
 
+def latency_summary(values: list[float]) -> dict[str, float]:
+    """返回小样本 benchmark 的中位数及观测 p10/p90。"""
+    ordered = sorted(values)
+    if not ordered:
+        raise ValueError("latency values 不能为空")
+    return {
+        "median": statistics.median(ordered),
+        "p10": ordered[max(0, math.ceil(0.10 * len(ordered)) - 1)],
+        "p90": ordered[max(0, math.ceil(0.90 * len(ordered)) - 1)],
+    }
+
+
+def reset_benchmark_seed(torch: Any, seed: int) -> None:
+    """让不同量化模式从相同 RNG 状态开始采样。"""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def run_latency_benchmark(config: BenchmarkConfig, results: dict[str, Any]) -> None:
     torch = require_torch()
     from myvllm.sampling_parameters import SamplingParams
@@ -404,28 +446,40 @@ def run_latency_benchmark(config: BenchmarkConfig, results: dict[str, Any]) -> N
             warm_params = SamplingParams(temperature=1e-6, max_tokens=4, max_model_length=config.latency_max_model_length)
             engine.generate([prompt], warm_params)
 
-            engine.add_prompt(prompt, params)
-            torch.cuda.synchronize()
-            start = time.time()
-            engine.step()
-            torch.cuda.synchronize()
-            ttft_ms = (time.time() - start) * 1000
-
-            decode_steps = 0
-            decode_start = time.time()
-            while not engine.scheduler.is_finished():
+            ttft_samples = []
+            tpot_samples = []
+            decode_step_samples = []
+            for repeat_idx in range(config.latency_repeats):
+                reset_benchmark_seed(torch, config.benchmark_seed + repeat_idx)
+                engine.add_prompt(prompt, params)
+                torch.cuda.synchronize()
+                start = time.perf_counter()
                 engine.step()
-                decode_steps += 1
-            torch.cuda.synchronize()
-            decode_s = time.time() - decode_start
+                torch.cuda.synchronize()
+                ttft_samples.append((time.perf_counter() - start) * 1000)
 
+                decode_steps = 0
+                decode_start = time.perf_counter()
+                while not engine.scheduler.is_finished():
+                    engine.step()
+                    decode_steps += 1
+                torch.cuda.synchronize()
+                decode_elapsed = time.perf_counter() - decode_start
+                tpot_samples.append(decode_elapsed * 1000 / max(decode_steps, 1))
+                decode_step_samples.append(decode_steps)
+
+            ttft_stats = latency_summary(ttft_samples)
+            tpot_stats = latency_summary(tpot_samples)
             results["latency"][mode] = {
-                "prompt_len": config.latency_prompt_len,
-                "gen_tokens": config.latency_gen_tokens,
-                "ttft_ms": ttft_ms,
-                "tpot_ms": decode_s / decode_steps * 1000 if decode_steps > 0 else float("nan"),
-                "decode_tokens_per_s": decode_steps / decode_s if decode_s > 0 else float("nan"),
-                "decode_steps": decode_steps,
+                "ttft_ms": ttft_stats["median"],
+                "ttft_p10_ms": ttft_stats["p10"],
+                "ttft_p90_ms": ttft_stats["p90"],
+                "tpot_ms": tpot_stats["median"],
+                "tpot_p10_ms": tpot_stats["p10"],
+                "tpot_p90_ms": tpot_stats["p90"],
+                "decode_tokens_per_s": 1000 / tpot_stats["median"] if tpot_stats["median"] > 0 else 0.0,
+                "decode_steps": int(statistics.median(decode_step_samples)),
+                "repeats": config.latency_repeats,
             }
         except Exception as exc:  # noqa: BLE001
             record_failure(results, "latency", mode, exc)
@@ -506,6 +560,91 @@ def decode_token_slice(tokenizer: Any, ids: list[int], center: int | None, radiu
     return tokenizer.decode(ids[start:end], skip_special_tokens=True)
 
 
+def _reference_hadamard(x: Any) -> Any:
+    """未归一化 Walsh-Hadamard 参考实现，用于 benchmark 数值诊断。"""
+    d = x.shape[-1]
+    h = 1
+    while h < d:
+        xv = x.reshape(*x.shape[:-1], d // (2 * h), 2, h)
+        a = xv[..., 0, :]
+        b = xv[..., 1, :]
+        x = __import__("torch").stack((a + b, a - b), dim=-2).reshape(x.shape)
+        h <<= 1
+    return x
+
+
+def _reference_rht(x: Any, inverse: bool = False) -> Any:
+    torch = require_torch()
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(0x9E3779B9)
+    signs = 2.0 * torch.bernoulli(torch.full((x.shape[-1],), 0.5), generator=generator) - 1.0
+    signs = signs.to(device=x.device, dtype=x.dtype)
+    return _reference_hadamard(x) * signs if inverse else _reference_hadamard(x * signs)
+
+
+def _reference_quant_roundtrip(x: Any, mode: str, group_size: int, use_rht: bool) -> Any:
+    torch = require_torch()
+    original = x
+    apply_rht = mode == "int4_per_token_head" or (mode == "int4_groupwise" and use_rht)
+    if apply_rht:
+        x = _reference_rht(x)
+
+    if mode == "auto":
+        restored = x
+    elif mode.startswith("fp8_"):
+        # 参考路径只测量缩放后的 FP8 round-trip；硬件不支持时跳过该模式。
+        if not hasattr(torch, "float8_e4m3fn"):
+            raise RuntimeError("当前 PyTorch 不支持 float8_e4m3fn")
+        if mode == "fp8_per_tensor":
+            scale = x.abs().amax().clamp_min(1e-6) / 448.0
+        else:
+            scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6) / 448.0
+        restored = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).float() * scale
+    elif mode == "int8_per_token_head":
+        scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6) / 127.0
+        restored = torch.round(x / scale).clamp(-128, 127) * scale
+    elif mode in ("int4_per_token_head", "int4_groupwise"):
+        effective_group = x.shape[-1] if mode == "int4_per_token_head" else group_size
+        grouped = x.reshape(*x.shape[:-1], x.shape[-1] // effective_group, effective_group)
+        minimum = grouped.amin(dim=-1, keepdim=True)
+        maximum = grouped.amax(dim=-1, keepdim=True)
+        scale = ((maximum - minimum) / 15.0).clamp_min(1e-6)
+        zero = torch.round(-minimum / scale).clamp(0, 15)
+        quantized = torch.round(grouped / scale + zero).clamp(0, 15)
+        restored = ((quantized - zero) * scale).reshape_as(x)
+    else:
+        raise ValueError(f"round-trip 暂不支持模式: {mode}")
+
+    if apply_rht:
+        restored = _reference_rht(restored, inverse=True) / x.shape[-1]
+    return restored.to(original.dtype)
+
+
+def run_roundtrip_benchmark(config: BenchmarkConfig, results: dict[str, Any]) -> None:
+    torch = require_torch()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    generator = torch.Generator(device=device)
+    generator.manual_seed(20260709)
+    sample = torch.randn(64, config.num_kv_heads, config.head_dim, generator=generator, dtype=torch.float32, device=device)
+    for mode in config.quant_modes:
+        try:
+            restored = _reference_quant_roundtrip(sample, mode, config.kv_group_size, config.kv_use_rht)
+            error = restored.float() - sample
+            cosine = torch.nn.functional.cosine_similarity(
+                restored.float().reshape(-1, config.head_dim),
+                sample.reshape(-1, config.head_dim),
+                dim=-1,
+            ).mean()
+            results["roundtrip"][mode] = {
+                "mae": float(error.abs().mean()),
+                "rmse": float(error.square().mean().sqrt()),
+                "max_abs": float(error.abs().max()),
+                "cosine": float(cosine),
+            }
+        except Exception as exc:  # noqa: BLE001
+            record_failure(results, "roundtrip", mode, exc)
+
+
 def token_diff_detail(tokenizer: Any, prompt: str, baseline_ids: list[int], current_ids: list[int]) -> dict[str, Any]:
     mismatch = first_mismatch_index(baseline_ids, current_ids)
     baseline_token = baseline_ids[mismatch] if mismatch is not None and mismatch < len(baseline_ids) else None
@@ -524,6 +663,7 @@ def token_diff_detail(tokenizer: Any, prompt: str, baseline_ids: list[int], curr
 
 
 def run_accuracy_benchmark(config: BenchmarkConfig, results: dict[str, Any]) -> None:
+    torch = require_torch()
     from myvllm.sampling_parameters import SamplingParams
 
     generated: dict[str, list[list[int]]] = {}
@@ -537,8 +677,10 @@ def run_accuracy_benchmark(config: BenchmarkConfig, results: dict[str, Any]) -> 
             params = SamplingParams(
                 temperature=1e-6,
                 max_tokens=config.accuracy_max_tokens,
+                ignore_eos=True,
                 max_model_length=config.accuracy_max_model_length,
             )
+            reset_benchmark_seed(torch, config.benchmark_seed)
             output = engine.generate(prompts, params)
             generated[mode] = output["token_ids"]
         except Exception as exc:  # noqa: BLE001
@@ -561,7 +703,7 @@ def run_accuracy_benchmark(config: BenchmarkConfig, results: dict[str, Any]) -> 
         prompt_rates = [detail["agreement"] for detail in prompt_details]
         avg = sum(prompt_rates) / len(prompt_rates) if prompt_rates else 1.0
         results["accuracy"][mode] = {
-            "token_agreement_vs_fp16": avg,
+            "token_agreement_vs_auto": avg,
             "prompt_agreements": prompt_rates,
             "num_prompts": len(prompt_rates),
             "details": prompt_details,
@@ -587,7 +729,23 @@ def print_report(config: BenchmarkConfig, results: dict[str, Any]) -> None:
             ])
         print_table(
             "Memory",
-            ["模式", "实际K dtype", "实际block字节(KB)", "相对auto实际", "max_cached_blocks", "容量提升"],
+            ["模式", "实际K dtype", "block总字节(KB,含scale)", "相对auto实际", "max_cached_blocks", "容量提升"],
+            rows,
+        )
+
+    if results.get("roundtrip"):
+        rows = []
+        for mode, item in results["roundtrip"].items():
+            rows.append([
+                mode,
+                f"{item['mae']:.6f}",
+                f"{item['rmse']:.6f}",
+                f"{item['max_abs']:.6f}",
+                f"{item['cosine']:.6f}",
+            ])
+        print_table(
+            "KV Quantization Round-trip",
+            ["模式", "MAE", "RMSE", "最大绝对误差", "Cosine"],
             rows,
         )
 
@@ -598,9 +756,14 @@ def print_report(config: BenchmarkConfig, results: dict[str, Any]) -> None:
                 mode,
                 f"{item['ttft_ms']:.1f}",
                 f"{item['tpot_ms']:.2f}",
+                f"{item['tpot_p10_ms']:.2f}-{item['tpot_p90_ms']:.2f}",
                 f"{item['decode_tokens_per_s']:.1f}",
             ])
-        print_table("Latency / Throughput", ["模式", "TTFT(ms)", "TPOT(ms)", "Decode吞吐(tok/s)"], rows)
+        print_table(
+            "Latency / Throughput",
+            ["模式", "TTFT中位数(ms)", "TPOT中位数(ms)", "TPOT p10-p90(ms)", "Decode吞吐(tok/s)"],
+            rows,
+        )
 
     if results.get("concurrency"):
         headers = ["模式"] + [f"batch={bs} tok/s" for bs in config.concurrency_batch_sizes] + ["扩展比"]
@@ -617,9 +780,9 @@ def print_report(config: BenchmarkConfig, results: dict[str, Any]) -> None:
     if results.get("accuracy"):
         rows = []
         for mode, item in results["accuracy"].items():
-            rate = item["token_agreement_vs_fp16"]
+            rate = item["token_agreement_vs_auto"]
             if mode == "auto":
-                note = "fp16 基线"
+                note = "auto 基线"
             elif rate >= 0.95:
                 note = "精度几乎无损"
             elif rate >= 0.8:
@@ -627,7 +790,7 @@ def print_report(config: BenchmarkConfig, results: dict[str, Any]) -> None:
             else:
                 note = "精度显著退化"
             rows.append([mode, f"{rate:.3f}", note])
-        print_table("Accuracy", ["模式", "token一致率(vs fp16)", "解读"], rows)
+        print_table("Accuracy", ["模式", "token一致率(vs auto)", "解读"], rows)
 
         detail_rows = []
         for mode, item in results["accuracy"].items():
@@ -719,10 +882,10 @@ def plot_results(config: BenchmarkConfig, results: dict[str, Any]) -> None:
 
     if results.get("accuracy"):
         fig, ax = plt.subplots(figsize=(7, 4.5))
-        vals = [results["accuracy"].get(m, {}).get("token_agreement_vs_fp16", 0) for m in modes]
+        vals = [results["accuracy"].get(m, {}).get("token_agreement_vs_auto", 0) for m in modes]
         ax.bar(modes, vals, color=[MODE_COLORS[m] for m in modes])
         ax.set_ylim(0, 1.1)
-        ax.set_ylabel("token agreement vs fp16")
+        ax.set_ylabel("token agreement vs auto")
         ax.set_title("Generation accuracy (higher=better)")
         for i, value in enumerate(vals):
             ax.text(i, value + 0.01, f"{value:.3f}", ha="center")
@@ -770,12 +933,12 @@ def plot_summary(config: BenchmarkConfig, results: dict[str, Any]) -> None:
     ax.set_ylabel("tokens / s")
 
     ax = axes[1][1]
-    vals = [results.get("accuracy", {}).get(m, {}).get("token_agreement_vs_fp16", 0) for m in modes]
+    vals = [results.get("accuracy", {}).get(m, {}).get("token_agreement_vs_auto", 0) for m in modes]
     ax.bar(modes, vals, color=colors)
     ax.set_ylim(0, 1.1)
     for i, value in enumerate(vals):
         ax.text(i, value + 0.01, f"{value:.3f}", ha="center")
-    ax.set_title("Accuracy: token agreement vs fp16 (higher=better)")
+    ax.set_title("Accuracy: token agreement vs auto (higher=better)")
     ax.set_ylabel("agreement")
 
     fig.tight_layout(rect=[0, 0, 1, 0.96])
@@ -784,7 +947,7 @@ def plot_summary(config: BenchmarkConfig, results: dict[str, Any]) -> None:
 
 
 def parse_suites(raw: str) -> set[str]:
-    valid = {"memory", "latency", "concurrency", "accuracy"}
+    valid = {"memory", "latency", "concurrency", "accuracy", "roundtrip"}
     if raw.strip().lower() == "all":
         return valid
     selected = {item.strip().lower() for item in raw.split(",") if item.strip()}
@@ -798,6 +961,8 @@ def run_selected_suites(config: BenchmarkConfig, selected: set[str]) -> dict[str
     results = empty_results(config)
     if "memory" in selected:
         run_memory_benchmark(config, results)
+    if "roundtrip" in selected:
+        run_roundtrip_benchmark(config, results)
     if "latency" in selected:
         run_latency_benchmark(config, results)
     if "concurrency" in selected:
@@ -809,15 +974,21 @@ def run_selected_suites(config: BenchmarkConfig, selected: set[str]) -> dict[str
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="KV Cache 量化 Benchmark")
-    parser.add_argument("--suite", default="all", help="评测模块，逗号分隔: memory,latency,concurrency,accuracy 或 all")
+    parser.add_argument("--suite", default="all", help="评测模块，逗号分隔: memory,roundtrip,latency,concurrency,accuracy 或 all")
     parser.add_argument("--output-dir", default=str(BenchmarkConfig.output_dir), help="结果输出目录")
     parser.add_argument("--no-plots", action="store_true", help="跳过 PNG 图输出")
+    parser.add_argument("--kv-group-size", type=int, default=32, help="INT4 group-wise 分组大小")
+    parser.add_argument("--kv-use-rht", action="store_true", help="INT4 group-wise 启用 RHT")
     args = parser.parse_args()
 
     torch = require_torch()
     assert torch.cuda.is_available(), "本 benchmark 需要 CUDA GPU"
 
-    config = BenchmarkConfig(output_dir=Path(args.output_dir))
+    config = BenchmarkConfig(
+        output_dir=Path(args.output_dir),
+        kv_group_size=args.kv_group_size,
+        kv_use_rht=args.kv_use_rht,
+    )
     selected = parse_suites(args.suite)
 
     print(f"运行评测模块: {sorted(selected)}")

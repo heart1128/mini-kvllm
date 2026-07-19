@@ -221,13 +221,30 @@ class ModelRunner:
         #   "fp8_per_tensor"     -> FP8 量化，整个 cache 共享一组 (K/V 各一个) 标量 scale
         #   "fp8_per_token_head" -> FP8 量化，每个 (token, kv_head) 组合独立一个 scale (对齐 vLLM)
         #   "int8_per_token_head"-> INT8 量化，每个 (token, kv_head) 组合独立一个 scale (对齐 vLLM)
+        #   "int4_per_token_head"-> INT4 量化，每两个 4-bit 值 pack 到 1 个 uint8 (模仿 vLLM)
+        #   "int4_groupwise"     -> INT4 group-wise 量化，每个 token/head/group 独立 scale/zp
         #   "kivi_2bit"          -> KIVI 2-bit 量化 (K per-channel-per-block / V per-token-per-head + fp16 residual)
         #   "kivi_4bit"          -> KIVI 4-bit 量化 (同上, bit-width 不同)
         # 参考 vLLM 的 KVQuantMode，per_token_head 精度更高、对离群值更鲁棒。
         self.kv_cache_dtype = self.config.get('kv_cache_dtype', 'auto')
-        is_per_token_head_quant = self.kv_cache_dtype in ('fp8_per_token_head', 'int8_per_token_head')
+        is_int4_per_token_head = self.kv_cache_dtype == 'int4_per_token_head'
+        is_int4_groupwise = self.kv_cache_dtype == 'int4_groupwise'
+        is_per_token_head_quant = self.kv_cache_dtype in ('fp8_per_token_head', 'int8_per_token_head', 'int4_per_token_head')
+        self.int4_group_size = int(self.config.get('kv_group_size', 32))
+        self.int4_use_rht = bool(self.config.get('kv_use_rht', False))
+        if is_int4_groupwise:
+            assert head_dim % self.int4_group_size == 0, (
+                f'head_dim {head_dim} must be divisible by kv_group_size {self.int4_group_size}'
+            )
+            if self.int4_use_rht:
+                assert head_dim > 0 and (head_dim & (head_dim - 1)) == 0, (
+                    f'RHT requires power-of-two head_dim, got {head_dim}'
+                )
         # 是否启用普通 KV cache 量化 (不含 KIVI)
-        self.kv_quant_enabled = self.kv_cache_dtype in ('fp8_per_tensor', 'fp8_per_token_head', 'int8_per_token_head')
+        self.kv_quant_enabled = self.kv_cache_dtype in (
+            'fp8_per_tensor', 'fp8_per_token_head', 'int8_per_token_head',
+            'int4_per_token_head', 'int4_groupwise',
+        )
         # 是否启用 KIVI 量化路径
         self.kivi_enabled = self.kv_cache_dtype.startswith('kivi')
         # KIVI 超参数 (仅 KIVI 路径生效)
@@ -235,15 +252,16 @@ class ModelRunner:
         self.kivi_group_size = int(self.config.get('kivi_group_size', 32))      # K 沿 head_dim 的分组宽度
         self.kivi_residual_length = int(self.config.get('kivi_residual_length', 32))  # fp16 buffer 容量
 
+        cache_head_dim = head_dim
+        # 按量化模式决定实际 cache dtype；不要在后续逻辑中再覆盖此值。
         if self.kivi_enabled:
-            # KIVI: 量化值用 int8 容器装载 (2-bit/4-bit 占低 bit; 不在分配阶段做 bit-pack, kernel 内逐元素读取)
-            # 这样 cache shape 与 fp16 完全一致，便于把 paged attention 的索引计算复用
-            kv_data_dtype = torch.int8
+            kv_data_dtype = torch.uint8
+        elif is_int4_per_token_head or is_int4_groupwise:
+            kv_data_dtype = torch.uint8
+            cache_head_dim = (head_dim + 1) // 2
         elif self.kv_cache_dtype == 'int8_per_token_head':
-            # INT8 per-token-head: 1 字节/元素，scale 与 fp8_per_token_head 同布局
             kv_data_dtype = torch.int8
-        elif self.kv_quant_enabled:
-            # FP8 e4m3fn: 1 字节/元素, 数值范围 [-448, 448]
+        elif self.kv_cache_dtype in ('fp8_per_tensor', 'fp8_per_token_head'):
             kv_data_dtype = torch.float8_e4m3fn
         else:
             kv_data_dtype = self.default_dtype
@@ -253,12 +271,15 @@ class ModelRunner:
 
         # check whether the current free memory can hold at least one block
         # compute the actual byte required of each block
-        # data 部分: block_size * 2(K和V) * num_layers * num_kv_heads * head_dim * elem_bytes
-        block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * elem_bytes
+        # data 部分: block_size * 2(K和V) * num_layers * num_kv_heads * cache_head_dim * elem_bytes
+        block_bytes = self.block_size * 2 * num_layers * num_kv_heads * cache_head_dim * elem_bytes
         # per_token_head 模式额外需要为每个 (slot, kv_head) 存一个 float32 scale (K/V 各一份)
         # 额外开销 = block_size * 2(K和V) * num_layers * num_kv_heads * 4(float32)
         if is_per_token_head_quant:
             block_bytes += self.block_size * 2 * num_layers * num_kv_heads * 4
+        elif is_int4_groupwise:
+            n_groups = head_dim // self.int4_group_size
+            block_bytes += self.block_size * 2 * num_layers * num_kv_heads * n_groups * 4
         if self.kivi_enabled:
             # KIVI 每个 block 额外开销 (按 fp32=4 bytes 计算):
             # - K scale + K zero: 2 * num_layers * block_size * num_kv_heads * (head_dim/group_size) * 4 bytes
@@ -304,12 +325,12 @@ class ModelRunner:
         # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
         max_cached_blocks = self.config['max_cached_blocks']
         # KV cache data 张量：dtype 由 kv_data_dtype 决定 (fp8 量化时为 float8_e4m3fn)
-        # 形状: (2, num_layers, max_cached_blocks, block_size, num_kv_heads, head_dim)
+        # 形状: (2, num_layers, max_cached_blocks, block_size, num_kv_heads, cache_head_dim)
         #       第 0 维 2 表示 K(=0) 和 V(=1)
 
         # 这里是分配kv cache的张量，后面分配scale的张量
         allocated_kv_cache = torch.zeros(
-            2, num_layers, max_cached_blocks, self.block_size, num_kv_heads, head_dim,
+            2, num_layers, max_cached_blocks, self.block_size, num_kv_heads, cache_head_dim,
             dtype=kv_data_dtype, device=f'cuda:{self.rank}'
         )
 
@@ -332,6 +353,15 @@ class ModelRunner:
             # 形状: (2, num_layers, max_cached_blocks, block_size, num_kv_heads)
             scale_buf = torch.ones(
                 2, num_layers, max_cached_blocks, self.block_size, num_kv_heads,
+                dtype=torch.float32, device=f'cuda:{self.rank}'
+            )
+            allocated_k_scale = scale_buf[0]
+            allocated_v_scale = scale_buf[1]
+        elif is_int4_groupwise:
+            # 每个 (block, slot, kv_head, group) 一个打包 scale/zp。
+            n_groups = head_dim // self.int4_group_size
+            scale_buf = torch.ones(
+                2, num_layers, max_cached_blocks, self.block_size, num_kv_heads, n_groups,
                 dtype=torch.float32, device=f'cuda:{self.rank}'
             )
             allocated_k_scale = scale_buf[0]
@@ -389,9 +419,11 @@ class ModelRunner:
                     module.k_zero = allocated_k_zero[layer_id]
                     module.k_residual = allocated_k_residual[layer_id]
                     module.v_residual = allocated_v_residual[layer_id]
-                    module.kivi_bits = self.kivi_bits
-                    module.kivi_group_size = self.kivi_group_size
-                    module.kivi_residual_length = self.kivi_residual_length
+                module.kivi_bits = self.kivi_bits
+                module.kivi_group_size = self.kivi_group_size
+                module.kivi_residual_length = self.kivi_residual_length
+                module.int4_group_size = self.int4_group_size
+                module.int4_use_rht = self.int4_use_rht
                 layer_id += 1
 
     # ============ KIVI residual buffer slot 管理 ============

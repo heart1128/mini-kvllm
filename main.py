@@ -27,7 +27,7 @@ def parse_args():
                         help='Number of distributed processes/tensor parallelism; current example is single-GPU single-process')
 
     # Chunked prefill config
-    parser.add_argument('--enable-chunked-prefill', action='store_true', default=False,
+    parser.add_argument('--enable-chunked-prefill', action='store_true', default=True,
                         help='Enable chunked prefill; long prompts can be split into multiple prefill rounds and mixed with decode')
     parser.add_argument('--disable-chunked-prefill', action='store_true',
                         help='Disable chunked prefill')
@@ -46,8 +46,13 @@ def parse_args():
     parser.add_argument('--use-cuda-graph', action='store_true',
                         help='Use CUDA graph for decoding; overrides --enforce-eager')
     parser.add_argument('--kv-cache-dtype', type=str, default='auto',
-                        choices=['auto', 'fp8_per_tensor', 'fp8_per_token_head', 'int8_per_token_head', 'kivi_2bit', 'kivi_4bit'],
+                        choices=['auto', 'fp8_per_tensor', 'fp8_per_token_head', 'int8_per_token_head',
+                                 'int4_per_token_head', 'int4_groupwise', 'kivi_2bit', 'kivi_4bit'],
                         help='KV cache storage dtype or quantization mode')
+    parser.add_argument('--kv-group-size', type=int, default=32,
+                        help='Group size for int4_groupwise KV cache quantization')
+    parser.add_argument('--kv-use-rht', action='store_true',
+                        help='Enable Randomized Hadamard Transform for int4_groupwise')
 
     # Model architecture
     parser.add_argument('--vocab-size', type=int, default=151936,
@@ -90,7 +95,7 @@ def parse_args():
     # Engine limits
     parser.add_argument('--max-num-batch-tokens', type=int, default=4096,
                         help='Max tokens for model runner warmup/graph capture; not the same as scheduler batched_tokens')
-    parser.add_argument('--max-model-length', type=int, default=1024,
+    parser.add_argument('--max-model-length', type=int, default=4096,
                         help='Max total length allowed per request, usually including prompt tokens and generated tokens')
     parser.add_argument('--gpu-memory-utilization', type=float, default=0.9,
                         help='Maximum GPU memory ratio used for KV cache allocation (0~1)')
@@ -131,6 +136,8 @@ def build_config(args):
         'model_name_or_path': args.model_name_or_path,
         'enforce_eager': args.enforce_eager and not args.use_cuda_graph,
         'kv_cache_dtype': args.kv_cache_dtype,
+        'kv_group_size': args.kv_group_size,
+        'kv_use_rht': args.kv_use_rht,
 
         # Model architecture
         'vocab_size': args.vocab_size,

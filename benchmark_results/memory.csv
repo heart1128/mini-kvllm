@@ -1,4 +1,0 @@
-模式,每block字节(KB),相对fp16,max_cached_blocks,容量提升
-auto,28672.0,1.000x,179,1.00x
-fp8_per_tensor,14336.0,0.500x,719,4.02x
-fp8_per_token_head,14784.0,0.516x,697,3.89x
